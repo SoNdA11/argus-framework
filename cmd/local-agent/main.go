@@ -80,37 +80,32 @@ func manageBLE(ctx context.Context, name string, adapterID int, powerChan <-chan
 	cscChar := cscSvc.NewCharacteristic(CSCMeasurementCharUUID)
 	cscChar.HandleNotify(ble.NotifyHandlerFunc(func(req ble.Request, ntf ble.Notifier) {
 		log.Printf("[AGENT-BLE] ✅ App %s inscrito para Cadência.", req.Conn().RemoteAddr())
-		defer log.Printf("[AGENT-BLE] 🔌 %s App desinscrito da Cadência.", req.Conn().RemoteAddr())
+		defer log.Printf("[AGENT-BLE] 🔌 App %s desinscrito da Cadência.", req.Conn().RemoteAddr())
 		
-		var cumulativeRevolutions, lastCrankEventTime uint16
-		var timeOfNextRevolution time.Time
+		var cumulativeRevolutions uint16
+		var lastCrankEventTime uint16
+
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
 
 		for {
 			select {
 			case <-ctx.Done(): return
 			case <-ntf.Context().Done(): return
-			case cadenciaAlvo := <-cadenceChan: // Se um novo alvo de cadência chegar...
-				if cadenciaAlvo <= 0 { timeOfNextRevolution = time.Time{}; continue }
-				if timeOfNextRevolution.IsZero() { timeOfNextRevolution = time.Now() }
-				
-				// Simula o evento da pedalada para enviar o pacote.
-				if time.Now().After(timeOfNextRevolution) {
-					cumulativeRevolutions++
-					lastCrankEventTime = uint16(time.Now().UnixNano() / 1e6 * 1024 / 1000)
-					flags := byte(0x02)
-					buf := new(bytes.Buffer)
-					binary.Write(buf, binary.LittleEndian, flags)
-					binary.Write(buf, binary.LittleEndian, cumulativeRevolutions)
-					binary.Write(buf, binary.LittleEndian, lastCrankEventTime)
-					if _, err := ntf.Write(buf.Bytes()); err != nil { return }
-					
-					intervalSeconds := 60.0 / float64(cadenciaAlvo)
-					timeOfNextRevolution = time.Now().Add(time.Duration(intervalSeconds * float64(time.Second)))
-				}
+			case cadenciaAlvo := <-cadenceChan:
+				revolutionsInInterval := float64(cadenciaAlvo) / 60.0 / 4.0
+				cumulativeRevolutions += uint16(revolutionsInInterval)
+				lastCrankEventTime += (1024 / 4)
+
+				flags := byte(0x02)
+				buf := new(bytes.Buffer)
+				binary.Write(buf, binary.LittleEndian, flags)
+				binary.Write(buf, binary.LittleEndian, cumulativeRevolutions)
+				binary.Write(buf, binary.LittleEndian, lastCrankEventTime)
+				if _, err := ntf.Write(buf.Bytes()); err != nil { return }
 			}
 		}
 	}))
-
 	d.AddService(powerSvc)
 	d.AddService(cscSvc)
 	d.AddService(ble.NewService(FTMSSvcUUID))
@@ -126,47 +121,92 @@ func main() {
 	addr := "wss://argus-remote-server.onrender.com/agent"
 	log.Printf("[AGENT] Iniciando agente local...")
 
+	// Cria um canal para ouvir por sinais de interrupção (Ctrl+C).
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
+
+	// Cria o contexto principal que pode ser cancelado para encerrar todas as goroutines.
 	ctx, cancel := context.WithCancel(context.Background())
+	// Garante que 'cancel()' seja chamado ao sair da função main, limpando tudo.
 	defer cancel()
-	go func() { <-interrupt; log.Println("Encerrando agente..."); cancel() }()
 
-	powerChan := make(chan int)
-	cadenceChan := make(chan int)
+	// Inicia uma goroutine para esperar pelo Ctrl+C e cancelar o contexto.
+	go func() {
+		<-interrupt
+		log.Println("Sinal de interrupção recebido, encerrando agente...")
+		cancel()
+	}()
 
+	// Canais para comunicação entre a lógica de WebSocket e a de BLE.
+	powerChan := make(chan int, 10)   // Buffer para não bloquear
+	cadenceChan := make(chan int, 10) // Buffer para não bloquear
+
+	// Loop infinito de reconexão.
 	for {
-		if ctx.Err() != nil { log.Println("Contexto cancelado. Saindo."); return }
+		// Se o contexto foi cancelado (Ctrl+C), sai do loop e encerra o programa.
+		if ctx.Err() != nil {
+			log.Println("Contexto cancelado. Saindo do loop de reconexão.")
+			return
+		}
 
 		log.Printf("[AGENT] Tentando se conectar a %s", addr)
 		c, _, err := websocket.DefaultDialer.Dial(addr, nil)
-		if err != nil { log.Println("[AGENT] ❌ Falha...:", err); time.Sleep(5 * time.Second); continue }
+		if err != nil {
+			log.Println("[AGENT] ❌ Falha ao conectar, tentando novamente em 5 segundos:", err)
+			time.Sleep(5 * time.Second)
+			continue // Tenta a conexão novamente.
+		}
 		log.Println("[AGENT] ✅ Conectado ao Servidor Remoto!")
 
-		for {
-			var cmd AgentCommand
-			if err := c.ReadJSON(&cmd); err != nil {
-				log.Println("[AGENT] 🔌 Desconectado:", err); c.Close(); break
+		// 'done' é um canal para sinalizar que a conexão foi perdida.
+		done := make(chan struct{})
+
+		// Inicia uma goroutine dedicada APENAS para ler mensagens do servidor.
+		go func() {
+			defer close(done) // Sinaliza que a leitura terminou (conexão caiu).
+			for {
+				var cmd AgentCommand
+				if err := c.ReadJSON(&cmd); err != nil {
+					log.Println("[AGENT] 🔌 Erro de leitura (desconectado):", err)
+					return // Encerra esta goroutine de leitura.
+				}
+
+				// Processa os comandos recebidos do servidor.
+				switch cmd.Action {
+				case "start_virtual_trainer":
+					log.Printf("[AGENT] << Comando '%s' recebido!", cmd.Action)
+					if name, ok := cmd.Payload["name"].(string); ok {
+						// Inicia a lógica BLE em uma goroutine separada.
+						go manageBLE(ctx, name, 0, powerChan, cadenceChan, c)
+					}
+				case "send_power":
+					if watts, ok := cmd.Payload["watts"].(float64); ok {
+						powerChan <- int(watts)
+					}
+				case "send_cadence":
+					if rpm, ok := cmd.Payload["rpm"].(float64); ok {
+						cadenceChan <- int(rpm)
+					}
+				default:
+					log.Printf("[AGENT] << Comando desconhecido recebido: %s", cmd.Action)
+				}
 			}
-			
-			switch cmd.Action {
-			case "start_virtual_trainer":
-				log.Printf("[AGENT] << Comando '%s' recebido!", cmd.Action)
-				if name, ok := cmd.Payload["name"].(string); ok {
-					go manageBLE(ctx, name, 0, powerChan, cadenceChan, c)
-				}
-			case "send_power":
-				if watts, ok := cmd.Payload["watts"].(float64); ok {
-					powerChan <- int(watts)
-				}
-			case "send_cadence":
-				if rpm, ok := cmd.Payload["rpm"].(float64); ok {
-					cadenceChan <- int(rpm)
-				}
-			default:
-				log.Printf("[AGENT] << Comando desconhecido: %s", cmd.Action)
-			}
+		}()
+
+		// O loop principal agora fica aqui, esperando por dois possíveis eventos:
+		// ou a conexão cair, ou o usuário apertar Ctrl+C.
+		select {
+		case <-done:
+			// 'done' foi fechado pela goroutine de leitura, indicando desconexão.
+			log.Println("[AGENT] Conexão perdida. Tentando reconectar...")
+			c.Close() // Fecha a conexão antiga antes de tentar uma nova.
+		case <-ctx.Done():
+			// O usuário apertou Ctrl+C.
+			log.Println("Sinal de encerramento recebido. Fechando conexão WebSocket...")
+			// Envia uma mensagem de fechamento limpo para o servidor.
+			c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			time.Sleep(1 * time.Second) // Dá um tempo para a mensagem ser enviada.
+			return                      // Encerra a função main e o programa.
 		}
-		c.Close()
 	}
 }

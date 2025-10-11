@@ -12,7 +12,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	
+
 	"github.com/gorilla/websocket"
 )
 
@@ -45,7 +45,7 @@ var (
 	agentMutex         sync.Mutex
 	dashboardClients   = make(map[*websocket.Conn]bool)
 	dashboardMutex     sync.Mutex
-	botCfg             = &BotConfig{PowerMin: 180, PowerMax: 220, CadenceMin: 85, CadenceMax: 95}
+	botCfg             = &BotConfig{PowerMin: 70, PowerMax: 110, CadenceMin: 85, CadenceMax: 95}
 	uiState            = &UIState{MainMode: "bot"}
 )
 
@@ -112,29 +112,29 @@ func botLogicRoutine(ctx context.Context) {
 	}
 }
 
-// broadcastToDashboards envia o estado atual para as UIs web.
+// broadcastToDashboards AGORA ENVIA TODOS OS DADOS DE STATUS
 func broadcastToDashboards(ctx context.Context) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done():
-			return
+		case <-ctx.Done(): return
 		case <-ticker.C:
 			dashboardMutex.Lock()
 			uiState.RLock()
+			// Monta a mensagem com TODOS os campos que a UI precisa
 			msg, _ := json.Marshal(map[string]interface{}{
 				"type":           "statusUpdate",
 				"modifiedPower":  uiState.ModifiedPower,
 				"heartRate":      uiState.HeartRate,
-				"appConnected":   uiState.AppConnected,
+				"appConnected":   uiState.AppConnected,   
 				"agentConnected": uiState.AgentConnected,
+				"realPower":      0, 
 			})
 			uiState.RUnlock()
 			for client := range dashboardClients {
 				if err := client.WriteMessage(websocket.TextMessage, msg); err != nil {
-					client.Close()
-					delete(dashboardClients, client)
+					client.Close(); delete(dashboardClients, client)
 				}
 			}
 			dashboardMutex.Unlock()
@@ -157,17 +157,10 @@ func sendCommandToAgent(action string, payload map[string]interface{}) {
 // handleAgentConnections gerencia a conexão do 'local-agent'.
 func handleAgentConnections(w http.ResponseWriter, r *http.Request) {
 	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("Erro no upgrade do agente: %v", err)
-		return
-	}
-
-	agentMutex.Lock()
-	agentConn = ws 
-	agentMutex.Unlock()
-	uiState.Lock()
-	uiState.AgentConnected = true
-	uiState.Unlock()
+	if err != nil { log.Printf("Erro no upgrade do agente: %v", err); return }
+	
+	agentMutex.Lock(); agentConn = ws; agentMutex.Unlock()
+	uiState.Lock(); uiState.AgentConnected = true; uiState.Unlock()
 	log.Println("[SERVER] ✅ Agente local conectado!")
 
 	sendCommandToAgent("start_virtual_trainer", map[string]interface{}{"name": "Argus Cloud Trainer"})
@@ -176,26 +169,18 @@ func handleAgentConnections(w http.ResponseWriter, r *http.Request) {
 		var event AgentEvent
 		if err := ws.ReadJSON(&event); err != nil {
 			log.Println("[SERVER] 🔌 Agente local desconectado:", err)
-			agentMutex.Lock()
-			agentConn = nil 
-			agentMutex.Unlock()
-			uiState.Lock()
-			uiState.AgentConnected = false
-			uiState.AppConnected = false
-			uiState.Unlock()
+			agentMutex.Lock(); agentConn = nil; agentMutex.Unlock()
+			uiState.Lock(); uiState.AgentConnected = false; uiState.AppConnected = false; uiState.Unlock()
 			break
 		}
 
+		// Processa o evento 'app_status' vindo do agente
 		if event.Event == "app_status" {
 			if connected, ok := event.Payload["connected"].(bool); ok {
 				uiState.Lock()
 				uiState.AppConnected = connected
 				uiState.Unlock()
-				if connected {
-					log.Println("[SERVER] 📲 Agente informou: App de ciclismo CONECTADO.")
-				} else {
-					log.Println("[SERVER] 📲 Agente informou: App de ciclismo DESCONECTADO.")
-				}
+				if connected { log.Println("[SERVER] 📲 Agente informou: App de ciclismo CONECTADO.") } else { log.Println("[SERVER] 📲 Agente informou: App de ciclismo DESCONECTADO.") }
 			}
 		}
 	}
@@ -204,46 +189,29 @@ func handleAgentConnections(w http.ResponseWriter, r *http.Request) {
 // handleDashboardConnections gerencia as conexões do dashboard web.
 func handleDashboardConnections(w http.ResponseWriter, r *http.Request, cancel context.CancelFunc) {
 	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	dashboardMutex.Lock()
-	dashboardClients[conn] = true
-	dashboardMutex.Unlock()
+	if err != nil { log.Println(err); return }
+	
+	dashboardMutex.Lock(); dashboardClients[conn] = true; dashboardMutex.Unlock()
 	log.Printf("[WEB] Novo dashboard conectado: %s", conn.RemoteAddr())
 
 	defer func() {
-		dashboardMutex.Lock()
-		delete(dashboardClients, conn)
-		dashboardMutex.Unlock()
+		dashboardMutex.Lock(); delete(dashboardClients, conn); dashboardMutex.Unlock()
 		conn.Close()
 		log.Printf("[WEB] Dashboard desconectado: %s", conn.RemoteAddr())
 	}()
 
-	for {
+	for { // Loop para ler comandos do dashboard
 		var msg map[string]interface{}
-		if err := conn.ReadJSON(&msg); err != nil {
-			break
-		}
+		if err := conn.ReadJSON(&msg); err != nil { break }
 		if msgType, ok := msg["type"].(string); ok {
 			switch msgType {
 			case "setBotConfig":
 				if payload, ok := msg["payload"].(map[string]interface{}); ok {
 					botCfg.Lock()
-					if v, ok := payload["powerMin"].(float64); ok {
-						botCfg.PowerMin = int(v)
-					}
-					if v, ok := payload["powerMax"].(float64); ok {
-						botCfg.PowerMax = int(v)
-					}
-					if v, ok := payload["cadenceMin"].(float64); ok {
-						botCfg.CadenceMin = int(v)
-					}
-					if v, ok := payload["cadenceMax"].(float64); ok {
-						botCfg.CadenceMax = int(v)
-					}
+					if v, ok := payload["powerMin"].(float64); ok { botCfg.PowerMin = int(v) }
+					if v, ok := payload["powerMax"].(float64); ok { botCfg.PowerMax = int(v) }
+					if v, ok := payload["cadenceMin"].(float64); ok { botCfg.CadenceMin = int(v) }
+					if v, ok := payload["cadenceMax"].(float64); ok { botCfg.CadenceMax = int(v) }
 					botCfg.Unlock()
 				}
 			case "shutdown":

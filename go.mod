@@ -1,6 +1,6 @@
 module argus-framework
 
-go 1.25.1
+go 1.25.0
 
 require (
 	github.com/go-ble/ble v0.0.0-20240122180141-8c5522f54333

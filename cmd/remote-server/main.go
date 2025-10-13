@@ -16,7 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// --- ESTRUTURAS DE ESTADO (Cérebro do Servidor) ---
+// --- ESTRUTURAS DE ESTADO ---
 type BotConfig struct {
 	sync.RWMutex
 	PowerMin, PowerMax, CadenceMin, CadenceMax int
@@ -38,18 +38,18 @@ type AgentEvent struct {
 	Payload map[string]interface{} `json:"payload"`
 }
 
-// --- VARIÁVEIS GLOBAIS DO SERVIDOR ---
+// --- VARIÁVEIS GLOBAIS ---
 var (
 	upgrader           = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 	agentConn          *websocket.Conn
 	agentMutex         sync.Mutex
 	dashboardClients   = make(map[*websocket.Conn]bool)
 	dashboardMutex     sync.Mutex
-	botCfg             = &BotConfig{PowerMin: 70, PowerMax: 110, CadenceMin: 85, CadenceMax: 95}
-	uiState            = &UIState{MainMode: "bot"}
+	botCfg             = &BotConfig{PowerMin: 180, PowerMax: 220, CadenceMin: 85, CadenceMax: 95}
+	uiState            = &UIState{MainMode: "bot"} // Modo padrão pode ser 'bot' ou 'boost'
 )
 
-// botLogicRoutine é a goroutine que gera os dados do bot e os envia para o agente.
+// botLogicRoutine gera os dados do bot.
 func botLogicRoutine(ctx context.Context) {
 	var botPowerTarget, botCadenceTarget int
 	var botPowerNextChange, botCadenceNextChange time.Time
@@ -60,48 +60,26 @@ func botLogicRoutine(ctx context.Context) {
 
 	for {
 		select {
-		case <-ctx.Done():
-			return
+		case <-ctx.Done(): return
 		case <-powerTicker.C:
-			if uiState.MainMode != "bot" {
-				continue
-			}
+			if uiState.MainMode != "bot" { continue }
 			if time.Now().After(botPowerNextChange) {
-				botCfg.RLock()
-				pMin, pMax := botCfg.PowerMin, botCfg.PowerMax
-				botCfg.RUnlock()
-				if pMax > pMin {
-					botPowerTarget = rand.Intn(pMax-pMin+1) + pMin
-				} else {
-					botPowerTarget = pMin
-				}
+				botCfg.RLock(); pMin, pMax := botCfg.PowerMin, botCfg.PowerMax; botCfg.RUnlock()
+				if pMax > pMin { botPowerTarget = rand.Intn(pMax-pMin+1) + pMin } else { botPowerTarget = pMin }
 				interval := rand.Intn(16) + 15
 				botPowerNextChange = time.Now().Add(time.Duration(interval) * time.Second)
 				log.Printf("[BOT] Novo alvo de potência: %dW", botPowerTarget)
 			}
 			ruido := rand.Intn(5) - 2
 			potenciaFinal := botPowerTarget + ruido
-			if potenciaFinal < 0 {
-				potenciaFinal = 0
-			}
-			uiState.Lock()
-			uiState.ModifiedPower = potenciaFinal
-			uiState.Unlock()
+			if potenciaFinal < 0 { potenciaFinal = 0 }
+			uiState.Lock(); uiState.ModifiedPower = potenciaFinal; uiState.Unlock()
 			sendCommandToAgent("send_power", map[string]interface{}{"watts": potenciaFinal})
-
 		case <-cadenceTicker.C:
-			if uiState.MainMode != "bot" {
-				continue
-			}
+			if uiState.MainMode != "bot" { continue }
 			if time.Now().After(botCadenceNextChange) {
-				botCfg.RLock()
-				cMin, cMax := botCfg.CadenceMin, botCfg.CadenceMax
-				botCfg.RUnlock()
-				if cMax > cMin {
-					botCadenceTarget = rand.Intn(cMax-cMin+1) + cMin
-				} else {
-					botCadenceTarget = cMin
-				}
+				botCfg.RLock(); cMin, cMax := botCfg.CadenceMin, botCfg.CadenceMax; botCfg.RUnlock()
+				if cMax > cMin { botCadenceTarget = rand.Intn(cMax-cMin+1) + cMin } else { botCadenceTarget = cMin }
 				interval := rand.Intn(21) + 20
 				botCadenceNextChange = time.Now().Add(time.Duration(interval) * time.Second)
 				log.Printf("[BOT] Novo alvo de cadência: %d RPM", botCadenceTarget)
@@ -112,7 +90,7 @@ func botLogicRoutine(ctx context.Context) {
 	}
 }
 
-// broadcastToDashboards AGORA ENVIA TODOS OS DADOS DE STATUS
+// broadcastToDashboards envia o estado atual para as UIs web.
 func broadcastToDashboards(ctx context.Context) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -122,14 +100,13 @@ func broadcastToDashboards(ctx context.Context) {
 		case <-ticker.C:
 			dashboardMutex.Lock()
 			uiState.RLock()
-			// Monta a mensagem com TODOS os campos que a UI precisa
 			msg, _ := json.Marshal(map[string]interface{}{
 				"type":           "statusUpdate",
 				"modifiedPower":  uiState.ModifiedPower,
 				"heartRate":      uiState.HeartRate,
-				"appConnected":   uiState.AppConnected,   
+				"appConnected":   uiState.AppConnected,
 				"agentConnected": uiState.AgentConnected,
-				"realPower":      0, 
+				"realPower":      0, // Placeholder, pois no modo remoto não temos o RealPower
 			})
 			uiState.RUnlock()
 			for client := range dashboardClients {
@@ -142,7 +119,7 @@ func broadcastToDashboards(ctx context.Context) {
 	}
 }
 
-// sendCommandToAgent usa a variável 'agentConn' para enviar um comando.
+// sendCommandToAgent envia um comando para o agente local conectado.
 func sendCommandToAgent(action string, payload map[string]interface{}) {
 	agentMutex.Lock()
 	defer agentMutex.Unlock()
@@ -173,20 +150,17 @@ func handleAgentConnections(w http.ResponseWriter, r *http.Request) {
 			uiState.Lock(); uiState.AgentConnected = false; uiState.AppConnected = false; uiState.Unlock()
 			break
 		}
-
-		// Processa o evento 'app_status' vindo do agente
 		if event.Event == "app_status" {
 			if connected, ok := event.Payload["connected"].(bool); ok {
-				uiState.Lock()
-				uiState.AppConnected = connected
-				uiState.Unlock()
+				uiState.Lock(); uiState.AppConnected = connected; uiState.Unlock()
 				if connected { log.Println("[SERVER] 📲 Agente informou: App de ciclismo CONECTADO.") } else { log.Println("[SERVER] 📲 Agente informou: App de ciclismo DESCONECTADO.") }
 			}
 		}
 	}
 }
 
-// handleDashboardConnections gerencia as conexões do dashboard web.
+// --- FUNÇÃO COMPLETAMENTE IMPLEMENTADA ---
+// handleDashboardConnections agora processa os comandos da UI.
 func handleDashboardConnections(w http.ResponseWriter, r *http.Request, cancel context.CancelFunc) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil { log.Println(err); return }
@@ -200,11 +174,22 @@ func handleDashboardConnections(w http.ResponseWriter, r *http.Request, cancel c
 		log.Printf("[WEB] Dashboard desconectado: %s", conn.RemoteAddr())
 	}()
 
-	for { // Loop para ler comandos do dashboard
+	// Loop para ler comandos vindos do dashboard.
+	for {
 		var msg map[string]interface{}
-		if err := conn.ReadJSON(&msg); err != nil { break }
+		if err := conn.ReadJSON(&msg); err != nil {
+			break // Sai do loop se o dashboard fechar a conexão.
+		}
+
 		if msgType, ok := msg["type"].(string); ok {
 			switch msgType {
+			case "setMainMode":
+				if payload, ok := msg["payload"].(map[string]interface{}); ok {
+					if mode, ok := payload["mode"].(string); ok {
+						uiState.Lock(); uiState.MainMode = mode; uiState.Unlock()
+						log.Printf("[WEB] Modo de operação alterado para: %s", mode)
+					}
+				}
 			case "setBotConfig":
 				if payload, ok := msg["payload"].(map[string]interface{}); ok {
 					botCfg.Lock()
@@ -214,6 +199,7 @@ func handleDashboardConnections(w http.ResponseWriter, r *http.Request, cancel c
 					if v, ok := payload["cadenceMax"].(float64); ok { botCfg.CadenceMax = int(v) }
 					botCfg.Unlock()
 				}
+			// Adicionar cases para 'setPowerConfig' e 'setResistanceConfig' aqui no futuro.
 			case "shutdown":
 				fmt.Println("[WEB] Comando de desligamento recebido!")
 				cancel()
@@ -222,15 +208,16 @@ func handleDashboardConnections(w http.ResponseWriter, r *http.Request, cancel c
 	}
 }
 
+
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() { 
+	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 		<-sig
 		cancel()
 	}()
-
+	
 	go botLogicRoutine(ctx)
 	go broadcastToDashboards(ctx)
 
@@ -240,14 +227,11 @@ func main() {
 	})
 	http.Handle("/", http.FileServer(http.Dir("./web")))
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
+	port := os.Getenv("PORT"); if port == "" { port = "8080" }
 	log.Printf("🚀 Servidor Remoto iniciado na porta %s...", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil && err != http.ErrServerClosed {
 		log.Fatal("ListenAndServe: ", err)
 	}
-
+	
 	log.Println("Servidor encerrado.")
 }

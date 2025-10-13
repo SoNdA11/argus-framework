@@ -4,11 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
     <title>Argus MitM Terminal</title>
-
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
-
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <link rel="stylesheet" href="style.css">
 </head>
@@ -18,13 +14,11 @@
             <h1>[ARGUS FRAMEWORK] - Man-in-the-Middle Interface</h1>
         </header>
 
-        <!-- Layout em duas colunas: main (esquerda) + sidebar (direita) -->
         <div class="columns">
-            <!-- MAIN: painel principal (controles, status, etc) -->
             <main class="main-panel">
                 <div class="status-panel">
                     <div id="client-status" class="status-box disconnected">
-                        <strong>&gt; ROLO_REAL:</strong> <span>OFFLINE</span>
+                        <strong>&gt; AGENTE_LOCAL:</strong> <span>OFFLINE</span>
                     </div>
                     <div id="server-status" class="status-box disconnected">
                         <strong>&gt; APP_VIRTUAL:</strong> <span>AWAITING_CONNECTION</span>
@@ -33,34 +27,44 @@
 
                 <div class="data-grid">
                     <div class="data-box">
-                        <h2>POTÊNCIA_REAL</h2>
+                        <h2 title="Potência lida do seu rolo de treino. Indisponível no Modo Bot.">POTÊNCIA_REAL</h2>
                         <p><span id="real-power">---</span> W</p>
                     </div>
                     <div class="data-box modified">
-                        <h2>POTÊNCIA_MODIFICADA</h2>
+                        <h2 title="Potência enviada para o jogo (real + ataque ou simulada).">POTÊNCIA_MODIFICADA</h2>
                         <p><span id="modified-power">---</span> W</p>
                     </div>
                     <div class="data-box">
-                        <h2>HEART_RATE_SIM</h2>
+                        <h2 title="Frequência cardíaca simulada.">HEART_RATE_SIM</h2>
                         <p><span id="heart-rate">---</span> BPM</p>
                     </div>
                 </div>
 
                 <section class="control-panel">
-                    <h2>// PAYLOAD_CONTROLS</h2>
+                    <h2>// MODO DE OPERAÇÃO</h2>
+                    <div class="control-item">
+                        <input type="radio" id="main-mode-boost" name="main-mode" value="boost" checked>
+                        <label for="main-mode-boost">Modo Boost (Dados Reais + Ataque)</label>
+                    </div>
+                    <div class="control-item">
+                        <input type="radio" id="main-mode-bot" name="main-mode" value="bot">
+                        <label for="main-mode-bot">Modo Bot (Simulação Total)</label>
+                    </div>
+                </section>
+
+                <section class="control-panel boost-controls">
+                    <h2>// BOOST PAYLOAD CONTROLS</h2>
                     <div class="control-item">
                         <input type="checkbox" id="attack-active" checked>
                         <label for="attack-active">Ataque Ativo</label>
                     </div>
-
                     <div class="control-item">
                         <label>Modo:</label>
-                        <input type="radio" id="mode-add" name="attack-mode" value="aditivo" checked>
+                        <input type="radio" id="mode-add" name="attack-mode" value="aditivo" checked> 
                         <label for="mode-add">(+W)</label>
-                        <input type="radio" id="mode-percent" name="attack-mode" value="percentual">
+                        <input type="radio" id="mode-percent" name="attack-mode" value="percentual"> 
                         <label for="mode-percent">(+%)</label>
                     </div>
-
                     <div class="control-item-range">
                         <label>Valor (<span id="slider-unit">W</span>): <span id="slider-value-display">30 - 70</span></label>
                         <div class="range-sliders">
@@ -72,22 +76,41 @@
                     </div>
                 </section>
 
+                <section class="control-panel bot-controls">
+                    <h2>// BOT SIMULATION CONTROLS</h2>
+                    <div class="control-item-range">
+                        <label>Range de Potência (W): <span id="bot-power-display">180 - 220</span></label>
+                        <div class="range-sliders">
+                            <label for="bot-power-min">Min:</label>
+                            <input type="range" id="bot-power-min" min="0" max="500" value="180">
+                            <label for="bot-power-max">Max:</label>
+                            <input type="range" id="bot-power-max" min="0" max="500" value="220">
+                        </div>
+                    </div>
+                     <div class="control-item-range">
+                        <label>Range de Cadência (RPM): <span id="bot-cadence-display">85 - 95</span></label>
+                        <div class="range-sliders">
+                            <label for="bot-cadence-min">Min:</label>
+                            <input type="range" id="bot-cadence-min" min="0" max="150" value="85">
+                            <label for="bot-cadence-max">Max:</label>
+                            <input type="range" id="bot-cadence-max" min="0" max="150" value="95">
+                        </div>
+                    </div>
+                </section>
+                
                 <section class="control-panel">
                     <h2>// FORWARD_CONTROLS</h2>
                     <div class="control-item">
                         <input type="checkbox" id="resistance-active" checked>
                         <label for="resistance-active">Encaminhar Resistência</label>
                     </div>
-                    <p class="note">>> Desmarque para ignorar comandos de resistência do app.</p>
                 </section>
 
-                <!-- Botão TERMINATE dentro do painel principal, alinhado ao rodapé -->
                 <div class="panel-footer">
                     <button id="shutdown-button">[TERMINATE_SESSION]</button>
                 </div>
             </main>
 
-            <!-- SIDEBAR: power timeline (um pouco mais larga) -->
             <aside class="sidebar">
                 <div class="chart-panel">
                     <h2>// POWER_TIMELINE</h2>
@@ -97,13 +120,10 @@
         </div>
 
         <footer class="footer">
-            <small>Argus Framework — protótipo</small>
+            <small>Argus Framework — Protótipo de Pesquisa</small>
         </footer>
     </div>
 
     <script src="app.js"></script>
 </body>
 </html>
-
-
-<!-- Antes de alterar -->

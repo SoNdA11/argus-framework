@@ -27,7 +27,7 @@ func HubRoutine(ctx context.Context, cancel context.CancelFunc, uiState *ble.UIS
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		handleWebSocket(w, r, cancel, powerCfg, resistanceCfg, &upgrader, &clients, &clientsMutex)
 	})
-	http.Handle("/", http.FileServer(http.Dir("./web")))
+	http.Handle("/", http.FileServer(http.Dir("./cmd/mitm-proxy/web")))
 
 	go func() {
 		fmt.Println("[WEB] Servidor web iniciado em http://localhost:8080")

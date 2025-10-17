@@ -1,6 +1,6 @@
 {
-  "client_adapter_id": 1, 
-  "server_adapter_id": 0,
+  "client_adapter_id": 3, 
+  "server_adapter_id": 4,
   "trainer_mac": "EE:91:12:FB:CE:97",
   "virtual_trainer_name": "Argus Trainer"
 }

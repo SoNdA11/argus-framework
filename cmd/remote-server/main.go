@@ -237,7 +237,7 @@ func main() {
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		handleDashboardConnections(w, r, cancel)
 	})
-	http.Handle("/", http.FileServer(http.Dir("./web")))
+	http.Handle("/", http.FileServer(http.Dir("./cmd/remote-server/web")))
 
 	port := os.Getenv("PORT"); if port == "" { port = "8080" }
 	log.Printf("🚀 Servidor Remoto iniciado na porta %s...", port)

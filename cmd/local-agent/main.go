@@ -183,10 +183,14 @@ func main() {
 					}
 				case "send_cadence":
 					if rpm, ok := cmd.Payload["rpm"].(float64); ok {
-						cadenceChan <- int(rpm)
+						select {
+						case cadenceChan <- int(rpm):
+						default:
+							// O canal de cadência também está cheio. Descartar.
+						}
 					}
 				default:
-					log.Printf("[AGENT] << Comando desconhecido recebido: %s", cmd.Action)
+					log.Printf("[AGENT] << Comando desconhecido: %s", cmd.Action)
 				}
 			}
 		}()

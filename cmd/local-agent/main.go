@@ -158,9 +158,6 @@ func main() {
 		// 'done' é um canal para sinalizar que a conexão foi perdida.
 		done := make(chan struct{})
 		
-		// CORREÇÃO 2: Cria um contexto específico para a sessão BLE.
-		bleCtx, bleCancel := context.WithCancel(ctx)
-
 		// Inicia uma goroutine dedicada APENAS para ler mensagens do servidor.
 		go func() {
 			defer close(done) // Sinaliza que a leitura terminou (conexão caiu).

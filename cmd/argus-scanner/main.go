@@ -120,7 +120,7 @@ func printProfile(p *ble.Profile) {
 	for _, s := range p.Services {
 		fmt.Printf("Serviço: %s (%s)\n", s.UUID, ble.Name(s.UUID))
 		for _, c := range s.Characteristics {
-			fmt.Printf("  - Característica: %s (%s), Propriedades: %s\n", c.UUID, ble.Name(c.UUID), c.Property)
+			fmt.Printf("  - Característica: %s (%s), Propriedades: %v\n", c.UUID, ble.Name(c.UUID), c.Property)
 		}
 	}
 	fmt.Println("-----------------------------------------")
@@ -167,21 +167,18 @@ func printResults(intervals []float64) {
 	fmt.Printf("Conclusão: %s\n", conclusion)
 }
 
-// --- FUNÇÃO CORRIGIDA AQUI ---
-// Esta versão é mais flexível e robusta para encontrar características.
 func findCharacteristic(p *ble.Profile, uuidStr string) *ble.Characteristic {
-	// Normaliza o UUID alvo para uma string minúscula sem hifens.
-	targetUUID := strings.ToLower(strings.ReplaceAll(uuidStr, "-", ""))
+    // Normaliza o UUID alvo para uma string minúscula sem hifens.
+    targetUUID := strings.ToLower(strings.ReplaceAll(uuidStr, "-", ""))
 
-	for _, s := range p.Services {
-		for _, c := range s.Characteristics {
-			// Normaliza o UUID encontrado da mesma forma.
-			foundUUID := strings.ToLower(strings.ReplaceAll(c.UUID.String(), "-", ""))
-			// Usa a verificação de string, que é mais tolerante.
-			if foundUUID == targetUUID {
-				return c
-			}
-		}
-	}
-	return nil
+    for _, s := range p.Services {
+        for _, c := range s.Characteristics {
+            // Normaliza o UUID encontrado da mesma forma.
+            foundUUID := strings.ToLower(strings.ReplaceAll(c.UUID.String(), "-", ""))
+            if strings.Contains(targetUUID, foundUUID) {
+                return c
+            }
+        }
+    }
+    return nil // Não encontrou
 }

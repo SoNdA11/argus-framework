@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"flag" 
+	"flag"
 	"fmt"
 	"log"
-	"os"        
-	"os/signal"  
-	"strings"    
-	"syscall"   
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-ble/ble"
@@ -35,34 +35,41 @@ var (
 	FTMSSvcUUID            = ble.MustParse("00001826-0000-1000-8000-00805f9b34fb")
 )
 
-// discoverAdapter procura por UM adaptador BLE funcional no sistema.
-func discoverAdapter() (int, error) {
-	log.Println("[AGENT-DISCOVERY] Procurando por adaptador BLE disponível...")
+// discoverAdapters (procura por 2 adaptadores)
+func discoverAdapters() (int, int, error) {
+	log.Println("[AGENT-DISCOVERY] Procurando por 2 adaptadores BLE disponíveis...")
+	var availableIDs []int
 
-	// Tenta de hci0 a hci9
 	for i := 0; i < 10; i++ {
-		// Tenta inicializar o dispositivo
 		d, err := linux.NewDevice(ble.OptDeviceID(i))
 		if err != nil {
-			// Se falhar (ex: "no such device" ou "RF-kill"), ignora e continua
+			log.Printf("[AGENT-DISCOVERY] Adaptador hci%d indisponível. Ignorando. (Erro: %v)", i, err)
 			continue
 		}
-
-		// Se funcionou, fecha/para o dispositivo para liberar o recurso
 		if err := d.Stop(); err != nil {
-			log.Printf("[AGENT-DISCOVERY] Aviso: falha ao parar hci%d após teste: %v", i, err)
+			log.Printf("[AGENT-DISCOVERY] Aviso: falha ao fechar o adaptador hci%d após o teste: %v", i, err)
 		}
-		
+
 		log.Printf("[AGENT-DISCOVERY] ✅ Adaptador hci%d encontrado e disponível.", i)
-		return i, nil // Retorna o ID do primeiro que encontrar
+		availableIDs = append(availableIDs, i)
+
+		if len(availableIDs) == 2 {
+			break
+		}
 	}
 
-	// Se o loop terminar, nenhum foi encontrado
-	return -1, fmt.Errorf("falha na descoberta: nenhum adaptador BLE disponível foi encontrado (verifique conexões e RF-kill)")
+	if len(availableIDs) < 2 {
+		return -1, -1, fmt.Errorf("falha na descoberta: Não foi possível encontrar 2 adaptadores BLE disponíveis")
+	}
+
+	clientID := availableIDs[0]
+	serverID := availableIDs[1]
+	log.Printf("[AGENT-DISCOVERY] Atribuição: hci%d (CLIENTE) | hci%d (SERVIDOR)", clientID, serverID)
+
+	return clientID, serverID, nil
 }
 
-// Esta função será a ÚNICA goroutine autorizada a escrever na conexão
-// para evitar o 'panic' de concorrência.
+// writePump (sem alterações)
 func writePump(ctx context.Context, c *websocket.Conn, writeChan <-chan interface{}, done chan struct{}) {
 	pingTicker := time.NewTicker(30 * time.Second)
 	defer func() {
@@ -73,63 +80,59 @@ func writePump(ctx context.Context, c *websocket.Conn, writeChan <-chan interfac
 	for {
 		select {
 		case <-ctx.Done():
-			// Contexto principal (Ctrl+C) foi cancelado
 			log.Println("[AGENT-WS] Encerrando write pump (sinal de interrupção)...")
-			// Envia uma mensagem de fechamento limpo
 			c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 			return
 		case <-done:
-			// 'done' é fechado se a goroutine de leitura (readPump) morrer.
 			log.Println("[AGENT-WS] Encerrando write pump (conexão perdida)...")
 			return
-		case msg := <-writeChan:
-			// Recebe uma mensagem do canal e a escreve no websocket
+		case msg, ok := <-writeChan:
+			if !ok {
+				log.Println("[AGENT-WS] Canal de escrita fechado.")
+				return
+			}
 			if err := c.WriteJSON(msg); err != nil {
 				log.Printf("[AGENT-WS] ❌ Erro ao escrever no websocket: %v", err)
-				return // Encerra o pump se a escrita falhar
+				return
 			}
 		case <-pingTicker.C:
-			// Envia o ping para manter a conexão viva
 			if err := c.WriteMessage(websocket.PingMessage, nil); err != nil {
 				log.Printf("[AGENT-WS] ❌ Erro ao enviar ping: %v", err)
-				return // Encerra se o ping falhar
+				return
 			}
 		}
 	}
 }
 
-// --- MODIFICADO: A função agora recebe o 'writeChan' para enviar dados
+// manageBLE (Servidor Virtual) - Esta função *DEFINE O DISPOSITIVO PADRÃO*
 func manageBLE(ctx context.Context, name string, adapterID int, powerChan <-chan int, cadenceChan <-chan int, writeChan chan<- interface{}) {
 	log.Printf("[AGENT-BLE] Iniciando rolo virtual no adaptador hci%d...", adapterID)
 	d, err := linux.NewDevice(ble.OptDeviceID(adapterID))
 	if err != nil {
 		log.Printf("[AGENT-BLE] ❌ Falha ao selecionar adaptador: %s", err)
-		// --- MODIFICADO: Envia para o canal, não escreve diretamente
 		writeChan <- AgentEvent{"error", map[string]interface{}{"message": err.Error()}}
 		return
 	}
+	// --- PONTO CRÍTICO ---
+	// Esta goroutine define o dispositivo padrão para o processo.
 	ble.SetDefaultDevice(d)
+	// --- FIM DO PONTO CRÍTICO ---
 
 	powerSvc := ble.NewService(PowerSvcUUID)
 	powerChar := powerSvc.NewCharacteristic(PowerCharUUID)
 	powerChar.HandleNotify(ble.NotifyHandlerFunc(func(req ble.Request, ntf ble.Notifier) {
 		log.Printf("[AGENT-BLE] ✅ App %s inscrito para Potência.", req.Conn().RemoteAddr())
-		// --- MODIFICADO: Envia para o canal, não escreve diretamente
 		writeChan <- AgentEvent{"app_status", map[string]interface{}{"connected": true}}
 		defer func() {
 			log.Printf("[AGENT-BLE] 🔌 App %s desinscrito da Potência.", req.Conn().RemoteAddr())
-			// --- MODIFICADO: Envia para o canal, não escreve diretamente
-			// Nota: Esta é a linha que causava o 'panic' quando o ^C era pressionado.
 			writeChan <- AgentEvent{"app_status", map[string]interface{}{"connected": false}}
 		}()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			// --- CORREÇÃO AQUI ---
-			case <-ntf.Context().Done(): // Era ntf.Context.Done()
+			case <-ntf.Context().Done():
 				return
-			// --- FIM DA CORREÇÃO ---
 			case watts := <-powerChan:
 				powerBytes := make([]byte, 4)
 				binary.LittleEndian.PutUint16(powerBytes[2:4], uint16(watts))
@@ -140,25 +143,22 @@ func manageBLE(ctx context.Context, name string, adapterID int, powerChan <-chan
 		}
 	}))
 
+	// ... (Lógica do CSC/Cadência permanece a mesma) ...
 	cscSvc := ble.NewService(CSCSvcUUID)
 	cscChar := cscSvc.NewCharacteristic(CSCMeasurementCharUUID)
 	cscChar.HandleNotify(ble.NotifyHandlerFunc(func(req ble.Request, ntf ble.Notifier) {
 		log.Printf("[AGENT-BLE] ✅ App %s inscrito para Cadência.", req.Conn().RemoteAddr())
 		defer log.Printf("[AGENT-BLE] 🔌 App %s desinscrito da Cadência.", req.Conn().RemoteAddr())
-
 		var cumulativeRevolutions uint16
 		var lastCrankEventTime uint16
-
 		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
-
 		var cadenciaAlvo int
-
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ntf.Context().Done(): // Esta já estava correta
+			case <-ntf.Context().Done():
 				return
 			case novoAlvo := <-cadenceChan:
 				cadenciaAlvo = novoAlvo
@@ -166,11 +166,9 @@ func manageBLE(ctx context.Context, name string, adapterID int, powerChan <-chan
 				if cadenciaAlvo <= 0 {
 					continue
 				}
-
 				revolutionsInInterval := float64(cadenciaAlvo) / 60.0 / 4.0
 				cumulativeRevolutions += uint16(revolutionsInInterval)
 				lastCrankEventTime += (1024 / 4)
-
 				flags := byte(0x02)
 				buf := new(bytes.Buffer)
 				binary.Write(buf, binary.LittleEndian, flags)
@@ -183,18 +181,23 @@ func manageBLE(ctx context.Context, name string, adapterID int, powerChan <-chan
 		}
 	}))
 
+	// --- MODIFICAÇÃO CRÍTICA: Usa o método Advertise do dispositivo 'd' ---
 	d.AddService(powerSvc)
 	d.AddService(cscSvc)
 	d.AddService(ble.NewService(FTMSSvcUUID))
 
 	log.Printf("[AGENT-BLE] 📣 Anunciando como '%s'...", name)
-	if err = ble.AdvertiseNameAndServices(ctx, name, PowerSvcUUID, FTMSSvcUUID, CSCSvcUUID); err != nil {
+	// Usa o método do dispositivo 'd', não o 'ble.Advertise...' global
+	if err = d.AdvertiseNameAndServices(ctx, name, PowerSvcUUID, FTMSSvcUUID, CSCSvcUUID); err != nil {
 		log.Printf("[AGENT-BLE] Erro ao anunciar: %v", err)
 	}
+	// --- FIM DA MODIFICAÇÃO ---
 	log.Println("[AGENT-BLE] Anúncio parado.")
 }
 
-// Esta função será responsável por se conectar ao seu rolo de treino.
+// --- REESCRITA: manageTrainerConnection (Cliente Real) ---
+// Esta função agora usa os métodos Scan/Dial do seu próprio dispositivo
+// e NUNCA toca no dispositivo padrão global.
 func manageTrainerConnection(ctx context.Context, mac string, adapterID int, writeChan chan<- interface{}) {
 	if mac == "" {
 		log.Println("[AGENT-TRAINER] ⚠️ MAC do rolo não fornecido (--mac). Apenas o rolo virtual funcionará.")
@@ -203,77 +206,97 @@ func manageTrainerConnection(ctx context.Context, mac string, adapterID int, wri
 
 	log.Printf("[AGENT-TRAINER] Iniciando conexão com o rolo real (%s) via hci%d...", mac, adapterID)
 
-	// Seleciona o mesmo adaptador. A biblioteca 'ble' lida com
-	// múltiplos papéis (Central e Periférico) no mesmo adaptador.
 	d, err := linux.NewDevice(ble.OptDeviceID(adapterID))
 	if err != nil {
 		log.Printf("[AGENT-TRAINER] ❌ Falha ao selecionar adaptador: %s", err)
 		return
 	}
-	ble.SetDefaultDevice(d)
+	// NENHUMA CHAMADA PARA ble.SetDefaultDevice(d) AQUI.
 
-	// Loop de reconexão
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			log.Println("[AGENT-TRAINER] Encerrando conexão com o rolo.")
 			return
-		default:
-			// Tenta conectar
-			log.Printf("[AGENT-TRAINER] 📡 Procurando por %s...", mac)
-			client, err := ble.Connect(ctx, func(a ble.Advertisement) bool {
-				// A função 'strings.EqualFold' agora irá compilar
-				return strings.EqualFold(a.Addr().String(), mac)
-			})
-			if err != nil {
-				log.Printf("[AGENT-TRAINER] Falha ao conectar: %v. Tentando novamente em 5s.", err)
-				time.Sleep(5 * time.Second)
-				continue
-			}
-
-			log.Println("[AGENT-TRAINER] ✅ Conectado ao rolo real!")
-
-			// Descobre o perfil
-			p, err := client.DiscoverProfile(true)
-			if err != nil {
-				log.Printf("[AGENT-TRAINER] ❌ Falha ao descobrir perfil: %v", err)
-				client.CancelConnection()
-				continue
-			}
-
-			// Procura a característica de potência
-			powerChar := findCharacteristic(p, PowerCharUUID)
-			if powerChar == nil {
-				log.Println("[AGENT-TRAINER] ❌ Característica de potência (2A63) não encontrada no rolo real.")
-				client.CancelConnection()
-				continue
-			}
-
-			// (Opcional: Adicionar Cadência aqui se o rolo real a suportar)
-
-			log.Println("[AGENT-TRAINER] 🔔 Inscrevendo-se para dados de potência real...")
-			if err := client.Subscribe(powerChar, false, func(data []byte) {
-				// (Fase 2) Envia dados para o servidor
-				if len(data) >= 4 {
-					powerValue := binary.LittleEndian.Uint16(data[2:4])
-					// Envia o dado para o servidor via o write pump
-					writeChan <- AgentEvent{"trainer_data", map[string]interface{}{
-						"real_power": int(powerValue),
-					}}
-				}
-			}); err != nil {
-				log.Printf("[AGENT-TRAINER] ❌ Falha ao se inscrever: %v", err)
-				client.CancelConnection()
-				continue
-			}
-
-			// Espera pela desconexão
-			<-client.Disconnected()
-			log.Println("[AGENT-TRAINER] 🔌 Desconectado do rolo real. Tentando reconectar...")
 		}
+
+		log.Printf("[AGENT-TRAINER] 📡 Procurando por %s...", mac)
+
+		// 1. Escaneia usando o dispositivo 'd'
+		advFilter := func(a ble.Advertisement) bool {
+			return strings.EqualFold(a.Addr().String(), mac)
+		}
+		
+		// Criamos um contexto de scan que podemos cancelar
+		scanCtx, scanCancel := context.WithTimeout(ctx, 15*time.Second) // Procura por 15s
+		var foundAddr ble.Addr
+		
+		// d.Scan usa o dispositivo 'd', não o padrão global
+		err = d.Scan(scanCtx, false, func(a ble.Advertisement) {
+			if advFilter(a) {
+				foundAddr = a.Addr()
+				scanCancel() // Para o scan assim que encontrar
+			}
+		})
+		scanCancel() // Garante que o scanCancel seja chamado
+		
+		if foundAddr == nil {
+			if err != nil && err != context.DeadlineExceeded {
+				log.Printf("[AGENT-TRAINER] Erro ao escanear: %v", err)
+			} else {
+				log.Println("[AGENT-TRAINER] Rolo não encontrado. Tentando novamente...")
+			}
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		// 2. Conecta (Dial) usando o dispositivo 'd'
+		log.Printf("[AGENT-TRAINER] Rolo encontrado. Conectando a %s...", foundAddr.String())
+		// d.Dial usa o dispositivo 'd', não o padrão global
+		client, err := d.Dial(ctx, foundAddr)
+		if err != nil {
+			log.Printf("[AGENT-TRAINER] Falha ao conectar: %v. Tentando novamente.", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		log.Println("[AGENT-TRAINER] ✅ Conectado ao rolo real!")
+
+		// 3. Descobre o perfil (agora deve funcionar)
+		p, err := client.DiscoverProfile(true)
+		if err != nil {
+			log.Printf("[AGENT-TRAINER] ❌ Falha ao descobrir perfil: %v", err)
+			client.CancelConnection()
+			continue
+		}
+
+		powerChar := findCharacteristic(p, PowerCharUUID)
+		if powerChar == nil {
+			log.Println("[AGENT-TRAINER] ❌ Característica de potência (2A63) não encontrada no rolo real.")
+			client.CancelConnection()
+			continue
+		}
+
+		log.Println("[AGENT-TRAINER] 🔔 Inscrevendo-se para dados de potência real...")
+		if err := client.Subscribe(powerChar, false, func(data []byte) {
+			if len(data) >= 4 {
+				powerValue := binary.LittleEndian.Uint16(data[2:4])
+				writeChan <- AgentEvent{"trainer_data", map[string]interface{}{
+					"real_power": int(powerValue),
+				}}
+			}
+		}); err != nil {
+			log.Printf("[AGENT-TRAINER] ❌ Falha ao se inscrever: %v", err)
+			client.CancelConnection()
+			continue
+		}
+
+		// 4. Espera pela desconexão
+		<-client.Disconnected()
+		log.Println("[AGENT-TRAINER] 🔌 Desconectado do rolo real. Tentando reconectar...")
 	}
 }
-// (Fase 1) Função auxiliar para encontrar características
+
+// findCharacteristic (sem alterações)
 func findCharacteristic(p *ble.Profile, uuid ble.UUID) *ble.Characteristic {
 	for _, s := range p.Services {
 		for _, c := range s.Characteristics {
@@ -285,10 +308,9 @@ func findCharacteristic(p *ble.Profile, uuid ble.UUID) *ble.Characteristic {
 	return nil
 }
 
+// main (sem alterações na lógica, apenas na inicialização)
 func main() {
-	adapterFlag := flag.Int("adapter", -1, "ID do adaptador HCI (ex: 0). Padrão -1 para auto-descoberta.")
 	agentKey := flag.String("key", "", "Chave de Agente (API Key) para autenticação")
-	// (Fase 1) Flag para o MAC do rolo
 	trainerMAC := flag.String("mac", "", "MAC Address do rolo de treino real (ex: AA:BB:CC:11:22:33)")
 	flag.Parse()
 
@@ -298,19 +320,12 @@ func main() {
 
 	addr := "wss://argus-remote-server.onrender.com/agent"
 
-	var finalAdapterID int
-	if *adapterFlag == -1 {
-		id, err := discoverAdapter()
-		if err != nil {
-			log.Fatalf("❌ %v", err)
-		}
-		finalAdapterID = id
-	} else {
-		log.Printf("[AGENT] Usando adaptador manual hci%d conforme flag.", *adapterFlag)
-		finalAdapterID = *adapterFlag
+	clientAdapterID, serverAdapterID, err := discoverAdapters()
+	if err != nil {
+		log.Fatalf("❌ %v", err)
 	}
 
-	log.Printf("[AGENT] Iniciando agente local no adaptador hci%d...", finalAdapterID)
+	log.Printf("[AGENT] Iniciando agente local... Cliente (hci%d) -> Servidor (hci%d)", clientAdapterID, serverAdapterID)
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
@@ -333,24 +348,19 @@ func main() {
 
 		log.Println("[AGENT] ✅ Conectado! Autenticando com a Chave de Agente...")
 		authMsg := map[string]string{"agent_key": *agentKey}
-		
-		// NOTA: O writePump ainda não está rodando, então é seguro
-		// fazer esta primeira escrita de autenticação diretamente.
 		if err := c.WriteJSON(authMsg); err != nil {
 			log.Println("❌ Falha ao enviar chave de autenticação:", err)
 			c.Close(); time.Sleep(5 * time.Second); continue
 		}
 
-		// Canal de escrita para este loop de conexão
 		writeChan := make(chan interface{}, 10)
 		done := make(chan struct{})
 		bleCtx, bleCancel := context.WithCancel(ctx)
 
-		// Inicia o writePump para esta conexão
 		go writePump(ctx, c, writeChan, done)
 
 		go func() {
-			defer func() { bleCancel(); close(done) }() // bleCancel() é importante aqui
+			defer func() { bleCancel(); close(done) }()
 			for {
 				var cmd AgentCommand
 				if err := c.ReadJSON(&cmd); err != nil {
@@ -360,11 +370,10 @@ func main() {
 				switch cmd.Action {
 				case "start_virtual_trainer":
 					if name, ok := cmd.Payload["name"].(string); ok {
-						// Passa o 'writeChan' para o manageBLE
-						go manageBLE(bleCtx, name, finalAdapterID, powerChan, cadenceChan, writeChan)
-
-						// (Fase 1) Inicia a conexão com o rolo real
-						go manageTrainerConnection(bleCtx, *trainerMAC, finalAdapterID, writeChan)
+						// Inicia o Servidor (que vai definir o DefaultDevice)
+						go manageBLE(bleCtx, name, serverAdapterID, powerChan, cadenceChan, writeChan)
+						// Inicia o Cliente (que usa seus próprios métodos de dispositivo)
+						go manageTrainerConnection(bleCtx, *trainerMAC, clientAdapterID, writeChan)
 					}
 				case "send_power":
 					if watts, ok := cmd.Payload["watts"].(float64); ok {
@@ -381,11 +390,8 @@ func main() {
 		select {
 		case <-done:
 			log.Println("[AGENT] Conexão perdida. Tentando reconectar...")
-			// O 'defer' na goroutine acima já chama bleCancel()
-			// O 'defer' no writePump já fecha o 'c.Close()'
 		case <-ctx.Done():
 			log.Println("Sinal de encerramento recebido. Fechando conexão...")
-			// O 'writePump' vai detectar o ctx.Done() e fechar a conexão
 			time.Sleep(1 * time.Second)
 			return
 		}

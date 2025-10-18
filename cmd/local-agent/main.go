@@ -35,7 +35,7 @@ var (
 	FTMSSvcUUID            = ble.MustParse("00001826-0000-1000-8000-00805f9b34fb")
 )
 
-// discoverAdapters (procura por 2 adaptadores)
+// discoverAdapters (sem alterações)
 func discoverAdapters() (int, int, error) {
 	log.Println("[AGENT-DISCOVERY] Procurando por 2 adaptadores BLE disponíveis...")
 	var availableIDs []int
@@ -104,7 +104,8 @@ func writePump(ctx context.Context, c *websocket.Conn, writeChan <-chan interfac
 	}
 }
 
-// manageBLE (Servidor Virtual) - Esta função *DEFINE O DISPOSITIVO PADRÃO*
+// --- MODIFICADO: manageBLE (Servidor Virtual) ---
+// Esta função NÃO define mais o dispositivo padrão.
 func manageBLE(ctx context.Context, name string, adapterID int, powerChan <-chan int, cadenceChan <-chan int, writeChan chan<- interface{}) {
 	log.Printf("[AGENT-BLE] Iniciando rolo virtual no adaptador hci%d...", adapterID)
 	d, err := linux.NewDevice(ble.OptDeviceID(adapterID))
@@ -113,10 +114,11 @@ func manageBLE(ctx context.Context, name string, adapterID int, powerChan <-chan
 		writeChan <- AgentEvent{"error", map[string]interface{}{"message": err.Error()}}
 		return
 	}
-	ble.SetDefaultDevice(d)
+	// --- REMOVIDO: ble.SetDefaultDevice(d) ---
 
 	powerSvc := ble.NewService(PowerSvcUUID)
 	powerChar := powerSvc.NewCharacteristic(PowerCharUUID)
+	// --- MODIFICADO: Usa o 'd' (device) para o HandleNotify ---
 	powerChar.HandleNotify(ble.NotifyHandlerFunc(func(req ble.Request, ntf ble.Notifier) {
 		log.Printf("[AGENT-BLE] ✅ App %s inscrito para Potência.", req.Conn().RemoteAddr())
 		writeChan <- AgentEvent{"app_status", map[string]interface{}{"connected": true}}
@@ -142,6 +144,7 @@ func manageBLE(ctx context.Context, name string, adapterID int, powerChan <-chan
 
 	cscSvc := ble.NewService(CSCSvcUUID)
 	cscChar := cscSvc.NewCharacteristic(CSCMeasurementCharUUID)
+	// --- MODIFICADO: Usa o 'd' (device) para o HandleNotify ---
 	cscChar.HandleNotify(ble.NotifyHandlerFunc(func(req ble.Request, ntf ble.Notifier) {
 		log.Printf("[AGENT-BLE] ✅ App %s inscrito para Cadência.", req.Conn().RemoteAddr())
 		defer log.Printf("[AGENT-BLE] 🔌 App %s desinscrito da Cadência.", req.Conn().RemoteAddr())
@@ -188,7 +191,9 @@ func manageBLE(ctx context.Context, name string, adapterID int, powerChan <-chan
 	log.Println("[AGENT-BLE] Anúncio parado.")
 }
 
-// manageTrainerConnection (Cliente Real)
+
+// --- REESCRITA: manageTrainerConnection (Cliente Real) ---
+// Esta função agora DEFINE O DISPOSITIVO PADRÃO e usa ble.Connect
 func manageTrainerConnection(ctx context.Context, mac string, adapterID int, writeChan chan<- interface{}) {
 	if mac == "" {
 		log.Println("[AGENT-TRAINER] ⚠️ MAC do rolo não fornecido (--mac). Apenas o rolo virtual funcionará.")
@@ -202,6 +207,10 @@ func manageTrainerConnection(ctx context.Context, mac string, adapterID int, wri
 		log.Printf("[AGENT-TRAINER] ❌ Falha ao selecionar adaptador: %s", err)
 		return
 	}
+	
+	// --- PONTO CRÍTICO: O CLIENTE agora define o dispositivo padrão ---
+	ble.SetDefaultDevice(d)
+	// --- FIM DO PONTO CRÍTICO ---
 
 	for {
 		if ctx.Err() != nil {
@@ -211,47 +220,28 @@ func manageTrainerConnection(ctx context.Context, mac string, adapterID int, wri
 
 		log.Printf("[AGENT-TRAINER] 📡 Procurando por %s...", mac)
 
+		// --- MODIFICADO: Usa o filtro e o ble.Connect (global) ---
 		advFilter := func(a ble.Advertisement) bool {
 			return strings.EqualFold(a.Addr().String(), mac)
 		}
-		
-		scanCtx, scanCancel := context.WithTimeout(ctx, 15*time.Second) 
-		var foundAddr ble.Addr
-		
-		err = d.Scan(scanCtx, false, func(a ble.Advertisement) {
-			if advFilter(a) {
-				foundAddr = a.Addr()
-				scanCancel() 
-			}
-		})
-		scanCancel() 
-		
-		if foundAddr == nil {
-			if err != nil && err != context.DeadlineExceeded {
-				log.Printf("[AGENT-TRAINER] Erro ao escanear: %v", err)
-			} else {
-				log.Println("[AGENT-TRAINER] Rolo não encontrado. Tentando novamente...")
-			}
-			time.Sleep(5 * time.Second)
-			continue
-		}
 
-		log.Printf("[AGENT-TRAINER] Rolo encontrado. Conectando a %s...", foundAddr.String())
-		client, err := d.Dial(ctx, foundAddr)
+		// ble.Connect usa o dispositivo padrão que acabamos de definir
+		client, err := ble.Connect(ctx, advFilter)
 		if err != nil {
 			log.Printf("[AGENT-TRAINER] Falha ao conectar: %v. Tentando novamente.", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
+		// --- FIM DA MODIFICAÇÃO ---
+
 
 		log.Println("[AGENT-TRAINER] ✅ Conectado ao rolo real!")
         
-        // +++ INÍCIO DA CORREÇÃO +++
-        // Adiciona um pequeno delay para estabilizar a conexão antes da descoberta
-        log.Println("[AGENT-TRAINER] Aguardando 1s para estabilizar a conexão...")
-        time.Sleep(1 * time.Second)
-        // +++ FIM DA CORREÇÃO +++
+        // Mantemos o delay de 1s para estabilidade
+		log.Println("[AGENT-TRAINER] Aguardando 1s para estabilizar a conexão...")
+		time.Sleep(1 * time.Second)
 
+		// A descoberta do perfil agora deve funcionar
 		p, err := client.DiscoverProfile(true)
 		if err != nil {
 			log.Printf("[AGENT-TRAINER] ❌ Falha ao descobrir perfil: %v", err)
@@ -359,8 +349,10 @@ func main() {
 				switch cmd.Action {
 				case "start_virtual_trainer":
 					if name, ok := cmd.Payload["name"].(string); ok {
-						go manageBLE(bleCtx, name, serverAdapterID, powerChan, cadenceChan, writeChan)
+						// O Cliente (que define o DefaultDevice) é iniciado primeiro.
 						go manageTrainerConnection(bleCtx, *trainerMAC, clientAdapterID, writeChan)
+						// O Servidor (que usa métodos de dispositivo) é iniciado em seguida.
+						go manageBLE(bleCtx, name, serverAdapterID, powerChan, cadenceChan, writeChan)
 					}
 				case "send_power":
 					if watts, ok := cmd.Payload["watts"].(float64); ok {

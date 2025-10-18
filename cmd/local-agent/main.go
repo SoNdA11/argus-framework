@@ -141,91 +141,88 @@ func manageBLE(ctx context.Context, name string, adapterID int, powerChan <-chan
 }
 
 func main() {
-    // 1. MUDANÇA: O padrão agora é -1 (para auto-descoberta)
     adapterFlag := flag.Int("adapter", -1, "ID do adaptador HCI (ex: 0). Padrão -1 para auto-descoberta.")
-    flag.Parse() // Faz a leitura da flag
+    agentKey := flag.String("key", "", "Chave de Agente (API Key) para autenticação")
+    flag.Parse()
+
+    if *agentKey == "" {
+        log.Fatal("❌ Erro: A flag --key é obrigatória. Obtenha a chave no seu dashboard.")
+    }
 
 	addr := "wss://argus-remote-server.onrender.com/agent"
 	
-	var finalAdapterID int // O ID que realmente usaremos
-
-	if *adapterFlag == -1 {
-		// Modo de auto-descoberta
-		id, err := discoverAdapter()
-		if err != nil {
-			log.Fatalf("❌ %v", err) // Para o programa se nenhum adaptador for encontrado
-		}
-		finalAdapterID = id
-	} else {
-		// Modo manual (usuário especificou a flag)
-		log.Printf("[AGENT] Usando adaptador manual hci%d conforme flag.", *adapterFlag)
-		finalAdapterID = *adapterFlag
-	}
+	var finalAdapterID int
+    if *adapterFlag == -1 {
+        id, err := discoverAdapter()
+        if err != nil {
+            log.Fatalf("❌ %v", err)
+        }
+        finalAdapterID = id
+    } else {
+        log.Printf("[AGENT] Usando adaptador manual hci%d conforme flag.", *adapterFlag)
+        finalAdapterID = *adapterFlag
+    }
 
 	log.Printf("[AGENT] Iniciando agente local no adaptador hci%d...", finalAdapterID)
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
-
 	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-interrupt; log.Println("Encerrando agente..."); cancel() }()
 	defer cancel()
-
-	go func() {
-		<-interrupt
-		log.Println("Sinal de interrupção recebido, encerrando agente...")
-		cancel()
-	}()
 
 	powerChan := make(chan int, 10)
 	cadenceChan := make(chan int, 10)
 
 	for {
-		if ctx.Err() != nil {
-			log.Println("Contexto cancelado. Saindo do loop de reconexão.")
-			return
-		}
+		if ctx.Err() != nil { log.Println("Contexto cancelado. Saindo."); return }
 
 		log.Printf("[AGENT] Tentando se conectar a %s", addr)
 		c, _, err := websocket.DefaultDialer.Dial(addr, nil)
-		if err != nil {
-			log.Println("[AGENT] ❌ Falha ao conectar, tentando novamente em 5 segundos:", err)
-			time.Sleep(5 * time.Second)
-			continue 
+		if err != nil { log.Println("❌ Falha...:", err); time.Sleep(5 * time.Second); continue }
+		
+		log.Println("[AGENT] ✅ Conectado! Autenticando com a Chave de Agente...")
+		authMsg := map[string]string{"agent_key": *agentKey}
+		if err := c.WriteJSON(authMsg); err != nil {
+			log.Println("❌ Falha ao enviar chave de autenticação:", err)
+			c.Close(); time.Sleep(5 * time.Second); continue
 		}
-		log.Println("[AGENT] ✅ Conectado ao Servidor Remoto!")
 
 		done := make(chan struct{})
-		
+		bleCtx, bleCancel := context.WithCancel(ctx) 
+
 		go func() {
-			defer close(done) 
+			defer func() { bleCancel(); close(done) }()
 			for {
 				var cmd AgentCommand
-				if err := c.ReadJSON(&cmd); err != nil {
-					log.Println("[AGENT] 🔌 Erro de leitura (desconectado):", err)
-					return 
-				}
-
+				if err := c.ReadJSON(&cmd); err != nil { log.Println("🔌 Erro de leitura:", err); return }
+				
 				switch cmd.Action {
 				case "start_virtual_trainer":
-					log.Printf("[AGENT] << Comando '%s' recebido!", cmd.Action)
 					if name, ok := cmd.Payload["name"].(string); ok {
-						// CORREÇÃO APLICADA AQUI:
-						// Usa o 'finalAdapterID' (descoberto ou da flag)
-						go manageBLE(ctx, name, finalAdapterID, powerChan, cadenceChan, c)
+						go manageBLE(bleCtx, name, finalAdapterID, powerChan, cadenceChan, c)
 					}
 				case "send_power":
 					if watts, ok := cmd.Payload["watts"].(float64); ok {
-						powerChan <- int(watts)
+						select { case powerChan <- int(watts): default: }
 					}
 				case "send_cadence":
 					if rpm, ok := cmd.Payload["rpm"].(float64); ok {
-						select {
-						case cadenceChan <- int(rpm):
-						default:
-						}
+						select { case cadenceChan <- int(rpm): default: }
 					}
-				default:
-					log.Printf("[AGENT] << Comando desconhecido: %s", cmd.Action)
+				}
+			}
+		}()
+		
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					if err := c.WriteMessage(websocket.PingMessage, []byte{}); err != nil { return }
+				case <-done: return
+				case <-ctx.Done(): return
 				}
 			}
 		}()
@@ -233,12 +230,13 @@ func main() {
 		select {
 		case <-done:
 			log.Println("[AGENT] Conexão perdida. Tentando reconectar...")
-			c.Close() 
+			c.Close()
+			bleCancel()
 		case <-ctx.Done():
-			log.Println("Sinal de encerramento recebido. Fechando conexão WebSocket...")
+			log.Println("Sinal de encerramento recebido. Fechando conexão...")
 			c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-			time.Sleep(1 * time.Second) 
-			return                      
+			time.Sleep(1 * time.Second)
+			return
 		}
 	}
 }

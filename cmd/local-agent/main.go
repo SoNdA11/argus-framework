@@ -190,8 +190,7 @@ func manageBLE(ctx context.Context, name string, adapterID int, powerChan <-chan
 }
 
 
-// --- REESCRITA (Novamente): manageTrainerConnection (Cliente Real) ---
-// Agora segue a estrutura de pkg/ble/client.go
+// Usa ble.Connect, define DefaultDevice, e tenta descoberta SELETIVA.
 func manageTrainerConnection(ctx context.Context, mac string, adapterID int, writeChan chan<- interface{}) {
 	if mac == "" {
 		log.Println("[AGENT-TRAINER] ⚠️ MAC do rolo não fornecido (--mac). Apenas o rolo virtual funcionará.")
@@ -200,26 +199,20 @@ func manageTrainerConnection(ctx context.Context, mac string, adapterID int, wri
 
 	log.Printf("[AGENT-TRAINER] Iniciando rotina de conexão com o rolo real (%s) via hci%d...", mac, adapterID)
 
-	// Loop principal de reconexão
 	for {
-		// Sai do loop se o contexto principal for cancelado (Ctrl+C)
 		if ctx.Err() != nil {
 			log.Println("[AGENT-TRAINER] Encerrando rotina do cliente.")
 			return
 		}
 
-		// --- PONTO CRÍTICO: Obtém o handle do dispositivo DENTRO do loop ---
 		log.Printf("[AGENT-TRAINER] Selecionando adaptador hci%d...", adapterID)
 		d, err := linux.NewDevice(ble.OptDeviceID(adapterID))
 		if err != nil {
 			log.Printf("[AGENT-TRAINER] ❌ Falha ao selecionar adaptador: %s. Tentando novamente em 5s.", err)
 			time.Sleep(5 * time.Second)
-			continue // Volta ao início do loop for
+			continue
 		}
-		// Define este como o dispositivo padrão PARA ESTA ITERAÇÃO
 		ble.SetDefaultDevice(d)
-		// --- FIM DO PONTO CRÍTICO ---
-
 
 		log.Printf("[AGENT-TRAINER] 📡 Procurando por %s...", mac)
 
@@ -227,44 +220,59 @@ func manageTrainerConnection(ctx context.Context, mac string, adapterID int, wri
 			return strings.EqualFold(a.Addr().String(), mac)
 		}
 
-		// Cria um contexto específico para a conexão, com timeout
-		connectCtx, cancelConnect := context.WithTimeout(ctx, 15*time.Second) // Timeout de 15s para conectar
-
+		connectCtx, cancelConnect := context.WithTimeout(ctx, 15*time.Second)
 		client, err := ble.Connect(connectCtx, advFilter)
-		cancelConnect() // Libera o contexto de conexão
+		cancelConnect()
 
 		if err != nil {
 			log.Printf("[AGENT-TRAINER] Falha ao conectar: %v. Tentando novamente.", err)
-			d.Stop() // Libera o dispositivo antes de tentar de novo
+			d.Stop()
 			time.Sleep(5 * time.Second)
-			continue // Volta ao início do loop for
+			continue
 		}
 
 		log.Println("[AGENT-TRAINER] ✅ Conectado ao rolo real!")
-
-		// Canal para sinalizar quando a conexão cair
 		disconnectedChan := client.Disconnected()
 
-		// Adiciona um pequeno delay após conectar, antes de descobrir
 		log.Println("[AGENT-TRAINER] Aguardando 1s para estabilizar a conexão...")
 		time.Sleep(1 * time.Second)
 
-		// Descobre o perfil
-		log.Println("[AGENT-TRAINER] Descobrindo perfil...")
-		p, err := client.DiscoverProfile(true)
+		// --- MODIFICAÇÃO CRÍTICA: Descoberta Seletiva ---
+		log.Println("[AGENT-TRAINER] Procurando pelo serviço Cycling Power (1818)...")
+		// 1. Tenta encontrar SOMENTE o serviço 1818
+		services, err := client.DiscoverServices([]ble.UUID{PowerSvcUUID})
 		if err != nil {
-			log.Printf("[AGENT-TRAINER] ❌ Falha ao descobrir perfil: %v", err)
-			client.CancelConnection() // Força a desconexão
-			// Espera a desconexão ser sinalizada antes de tentar novamente
+			log.Printf("[AGENT-TRAINER] ❌ Falha ao procurar serviço 1818: %v", err)
+			client.CancelConnection()
 			<-disconnectedChan
-			log.Println("[AGENT-TRAINER] Desconexão confirmada após falha na descoberta.")
-			d.Stop() // Libera o dispositivo
-			continue // Volta ao início do loop for
+			log.Println("[AGENT-TRAINER] Desconexão confirmada após falha na descoberta do serviço.")
+			d.Stop()
+			continue
+		}
+		if len(services) == 0 {
+			log.Println("[AGENT-TRAINER] ❌ Serviço Cycling Power (1818) não encontrado.")
+			client.CancelConnection()
+			<-disconnectedChan
+			log.Println("[AGENT-TRAINER] Desconexão confirmada após serviço não encontrado.")
+			d.Stop()
+			continue
 		}
 
-		powerChar := findCharacteristic(p, PowerCharUUID)
-		if powerChar == nil {
-			log.Println("[AGENT-TRAINER] ❌ Característica de potência (2A63) não encontrada no rolo real.")
+		log.Println("[AGENT-TRAINER] ✅ Serviço Cycling Power encontrado! Procurando características...")
+		powerService := services[0]
+
+		// 2. Tenta encontrar SOMENTE as características DENTRO do serviço 1818
+		chars, err := client.DiscoverCharacteristics([]ble.UUID{PowerCharUUID}, powerService)
+		if err != nil {
+			log.Printf("[AGENT-TRAINER] ❌ Falha ao procurar característica 2A63: %v", err)
+			client.CancelConnection()
+			<-disconnectedChan
+			log.Println("[AGENT-TRAINER] Desconexão confirmada após falha na descoberta da característica.")
+			d.Stop()
+			continue
+		}
+		if len(chars) == 0 {
+			log.Println("[AGENT-TRAINER] ❌ Característica Cycling Power Measurement (2A63) não encontrada.")
 			client.CancelConnection()
 			<-disconnectedChan
 			log.Println("[AGENT-TRAINER] Desconexão confirmada após característica não encontrada.")
@@ -272,14 +280,16 @@ func manageTrainerConnection(ctx context.Context, mac string, adapterID int, wri
 			continue
 		}
 
+		powerChar := chars[0]
+		// --- FIM DA MODIFICAÇÃO CRÍTICA ---
+
+		log.Println("[AGENT-TRAINER] ✅ Característica 2A63 encontrada!")
 		log.Println("[AGENT-TRAINER] 🔔 Inscrevendo-se para dados de potência real...")
 		err = client.Subscribe(powerChar, false, func(data []byte) {
 			if len(data) >= 4 {
 				powerValue := binary.LittleEndian.Uint16(data[2:4])
-				// Envia para o servidor
 				select {
 				case writeChan <- AgentEvent{"trainer_data", map[string]interface{}{"real_power": int(powerValue)}}:
-				// Adiciona um default para não bloquear se o writeChan estiver cheio (pouco provável)
 				default:
 					log.Println("[AGENT-TRAINER] Aviso: Canal de escrita cheio, descartando dado de potência.")
 				}
@@ -296,21 +306,17 @@ func manageTrainerConnection(ctx context.Context, mac string, adapterID int, wri
 
 		log.Println("[AGENT-TRAINER] Inscrição bem-sucedida. Monitorando conexão...")
 
-		// Mantém a goroutine viva até a desconexão ou cancelamento do contexto
 		select {
 		case <-disconnectedChan:
 			log.Println("[AGENT-TRAINER] 🔌 Desconectado do rolo real. Tentando reconectar...")
-			// O loop 'for' vai recomeçar
 		case <-ctx.Done():
 			log.Println("[AGENT-TRAINER] Contexto cancelado. Desconectando do rolo...")
-			client.CancelConnection() // Tenta desconectar graciosamente
-			<-disconnectedChan        // Espera a confirmação
+			client.CancelConnection()
+			<-disconnectedChan
 			log.Println("[AGENT-TRAINER] Desconexão confirmada após cancelamento.")
-			// A função vai retornar no início do próximo loop
 		}
 		
-		// Libera o dispositivo antes da próxima iteração
-		d.Stop() 
+		d.Stop()
 	}
 }
 

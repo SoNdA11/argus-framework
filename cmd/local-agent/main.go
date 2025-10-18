@@ -113,10 +113,7 @@ func manageBLE(ctx context.Context, name string, adapterID int, powerChan <-chan
 		writeChan <- AgentEvent{"error", map[string]interface{}{"message": err.Error()}}
 		return
 	}
-	// --- PONTO CRÍTICO ---
-	// Esta goroutine define o dispositivo padrão para o processo.
 	ble.SetDefaultDevice(d)
-	// --- FIM DO PONTO CRÍTICO ---
 
 	powerSvc := ble.NewService(PowerSvcUUID)
 	powerChar := powerSvc.NewCharacteristic(PowerCharUUID)
@@ -143,7 +140,6 @@ func manageBLE(ctx context.Context, name string, adapterID int, powerChan <-chan
 		}
 	}))
 
-	// ... (Lógica do CSC/Cadência permanece a mesma) ...
 	cscSvc := ble.NewService(CSCSvcUUID)
 	cscChar := cscSvc.NewCharacteristic(CSCMeasurementCharUUID)
 	cscChar.HandleNotify(ble.NotifyHandlerFunc(func(req ble.Request, ntf ble.Notifier) {
@@ -181,23 +177,18 @@ func manageBLE(ctx context.Context, name string, adapterID int, powerChan <-chan
 		}
 	}))
 
-	// --- MODIFICAÇÃO CRÍTICA: Usa o método Advertise do dispositivo 'd' ---
 	d.AddService(powerSvc)
 	d.AddService(cscSvc)
 	d.AddService(ble.NewService(FTMSSvcUUID))
 
 	log.Printf("[AGENT-BLE] 📣 Anunciando como '%s'...", name)
-	// Usa o método do dispositivo 'd', não o 'ble.Advertise...' global
 	if err = d.AdvertiseNameAndServices(ctx, name, PowerSvcUUID, FTMSSvcUUID, CSCSvcUUID); err != nil {
 		log.Printf("[AGENT-BLE] Erro ao anunciar: %v", err)
 	}
-	// --- FIM DA MODIFICAÇÃO ---
 	log.Println("[AGENT-BLE] Anúncio parado.")
 }
 
-// --- REESCRITA: manageTrainerConnection (Cliente Real) ---
-// Esta função agora usa os métodos Scan/Dial do seu próprio dispositivo
-// e NUNCA toca no dispositivo padrão global.
+// manageTrainerConnection (Cliente Real)
 func manageTrainerConnection(ctx context.Context, mac string, adapterID int, writeChan chan<- interface{}) {
 	if mac == "" {
 		log.Println("[AGENT-TRAINER] ⚠️ MAC do rolo não fornecido (--mac). Apenas o rolo virtual funcionará.")
@@ -211,7 +202,6 @@ func manageTrainerConnection(ctx context.Context, mac string, adapterID int, wri
 		log.Printf("[AGENT-TRAINER] ❌ Falha ao selecionar adaptador: %s", err)
 		return
 	}
-	// NENHUMA CHAMADA PARA ble.SetDefaultDevice(d) AQUI.
 
 	for {
 		if ctx.Err() != nil {
@@ -221,23 +211,20 @@ func manageTrainerConnection(ctx context.Context, mac string, adapterID int, wri
 
 		log.Printf("[AGENT-TRAINER] 📡 Procurando por %s...", mac)
 
-		// 1. Escaneia usando o dispositivo 'd'
 		advFilter := func(a ble.Advertisement) bool {
 			return strings.EqualFold(a.Addr().String(), mac)
 		}
 		
-		// Criamos um contexto de scan que podemos cancelar
-		scanCtx, scanCancel := context.WithTimeout(ctx, 15*time.Second) // Procura por 15s
+		scanCtx, scanCancel := context.WithTimeout(ctx, 15*time.Second) 
 		var foundAddr ble.Addr
 		
-		// d.Scan usa o dispositivo 'd', não o padrão global
 		err = d.Scan(scanCtx, false, func(a ble.Advertisement) {
 			if advFilter(a) {
 				foundAddr = a.Addr()
-				scanCancel() // Para o scan assim que encontrar
+				scanCancel() 
 			}
 		})
-		scanCancel() // Garante que o scanCancel seja chamado
+		scanCancel() 
 		
 		if foundAddr == nil {
 			if err != nil && err != context.DeadlineExceeded {
@@ -249,9 +236,7 @@ func manageTrainerConnection(ctx context.Context, mac string, adapterID int, wri
 			continue
 		}
 
-		// 2. Conecta (Dial) usando o dispositivo 'd'
 		log.Printf("[AGENT-TRAINER] Rolo encontrado. Conectando a %s...", foundAddr.String())
-		// d.Dial usa o dispositivo 'd', não o padrão global
 		client, err := d.Dial(ctx, foundAddr)
 		if err != nil {
 			log.Printf("[AGENT-TRAINER] Falha ao conectar: %v. Tentando novamente.", err)
@@ -260,8 +245,13 @@ func manageTrainerConnection(ctx context.Context, mac string, adapterID int, wri
 		}
 
 		log.Println("[AGENT-TRAINER] ✅ Conectado ao rolo real!")
+        
+        // +++ INÍCIO DA CORREÇÃO +++
+        // Adiciona um pequeno delay para estabilizar a conexão antes da descoberta
+        log.Println("[AGENT-TRAINER] Aguardando 1s para estabilizar a conexão...")
+        time.Sleep(1 * time.Second)
+        // +++ FIM DA CORREÇÃO +++
 
-		// 3. Descobre o perfil (agora deve funcionar)
 		p, err := client.DiscoverProfile(true)
 		if err != nil {
 			log.Printf("[AGENT-TRAINER] ❌ Falha ao descobrir perfil: %v", err)
@@ -290,7 +280,6 @@ func manageTrainerConnection(ctx context.Context, mac string, adapterID int, wri
 			continue
 		}
 
-		// 4. Espera pela desconexão
 		<-client.Disconnected()
 		log.Println("[AGENT-TRAINER] 🔌 Desconectado do rolo real. Tentando reconectar...")
 	}
@@ -308,7 +297,7 @@ func findCharacteristic(p *ble.Profile, uuid ble.UUID) *ble.Characteristic {
 	return nil
 }
 
-// main (sem alterações na lógica, apenas na inicialização)
+// main (sem alterações)
 func main() {
 	agentKey := flag.String("key", "", "Chave de Agente (API Key) para autenticação")
 	trainerMAC := flag.String("mac", "", "MAC Address do rolo de treino real (ex: AA:BB:CC:11:22:33)")
@@ -370,9 +359,7 @@ func main() {
 				switch cmd.Action {
 				case "start_virtual_trainer":
 					if name, ok := cmd.Payload["name"].(string); ok {
-						// Inicia o Servidor (que vai definir o DefaultDevice)
 						go manageBLE(bleCtx, name, serverAdapterID, powerChan, cadenceChan, writeChan)
-						// Inicia o Cliente (que usa seus próprios métodos de dispositivo)
 						go manageTrainerConnection(bleCtx, *trainerMAC, clientAdapterID, writeChan)
 					}
 				case "send_power":

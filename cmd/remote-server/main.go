@@ -306,18 +306,29 @@ func handleAgentConnections(w http.ResponseWriter, r *http.Request, mainCtx cont
 	sessionManager.Unlock()
 }
 
-
 // handleDashboardConnections autentica e gerencia um dashboard web
 func handleDashboardConnections(w http.ResponseWriter, r *http.Request, cancel context.CancelFunc) {
 	agentKey := "paulo_sk_123abc" // Placeholder
-	
+
 	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil { log.Println(err); return }
-	
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
 	sessionManager.Lock()
+	// +++ INÍCIO DA CORREÇÃO +++
+	// Garante que os mapas de estado existam, não importa quem conecte primeiro.
 	if _, ok := sessionManager.Dashboards[agentKey]; !ok {
 		sessionManager.Dashboards[agentKey] = make(map[*websocket.Conn]bool)
 	}
+	if _, ok := sessionManager.UserStates[agentKey]; !ok {
+		log.Printf("[SERVER] Inicializando estado para %s a partir da conexão do dashboard.", agentKey)
+		sessionManager.UserStates[agentKey] = &UIState{MainMode: "bot"}
+		sessionManager.BotConfigs[agentKey] = &BotConfig{PowerMin: 180, PowerMax: 220, CadenceMin: 85, CadenceMax: 95}
+	}
+	// +++ FIM DA CORREÇÃO +++
+
 	sessionManager.Dashboards[agentKey][conn] = true
 	sessionManager.Unlock()
 	log.Printf("[WEB] Novo dashboard conectado para o agente %s", agentKey)
@@ -332,11 +343,14 @@ func handleDashboardConnections(w http.ResponseWriter, r *http.Request, cancel c
 
 	for {
 		var msg map[string]interface{}
-		if err := conn.ReadJSON(&msg); err != nil { break }
-		
+		if err := conn.ReadJSON(&msg); err != nil {
+			break
+		}
+
 		log.Printf("[WEB] Comando recebido do dashboard: %v", msg)
 
 		if msgType, ok := msg["type"].(string); ok {
+			// Agora estas buscas são seguras, pois garantimos a inicialização acima
 			botCfg := sessionManager.BotConfigs[agentKey]
 			uiState := sessionManager.UserStates[agentKey]
 
@@ -344,20 +358,31 @@ func handleDashboardConnections(w http.ResponseWriter, r *http.Request, cancel c
 			case "setMainMode":
 				if payload, ok := msg["payload"].(map[string]interface{}); ok {
 					if mode, ok := payload["mode"].(string); ok {
-						uiState.Lock(); uiState.MainMode = mode; uiState.Unlock()
+						uiState.Lock()
+						uiState.MainMode = mode
+						uiState.Unlock()
 					}
 				}
 			case "setBotConfig":
 				if payload, ok := msg["payload"].(map[string]interface{}); ok {
 					botCfg.Lock()
-					if v, ok := payload["powerMin"].(float64); ok { botCfg.PowerMin = int(v) }
-					if v, ok := payload["powerMax"].(float64); ok { botCfg.PowerMax = int(v) }
-					if v, ok := payload["cadenceMin"].(float64); ok { botCfg.CadenceMin = int(v) }
-					if v, ok := payload["cadenceMax"].(float64); ok { botCfg.CadenceMax = int(v) }
+					if v, ok := payload["powerMin"].(float64); ok {
+						botCfg.PowerMin = int(v)
+					}
+					if v, ok := payload["powerMax"].(float64); ok {
+						botCfg.PowerMax = int(v)
+					}
+					if v, ok := payload["cadenceMin"].(float64); ok {
+						botCfg.CadenceMin = int(v)
+					}
+					if v, ok := payload["cadenceMax"].(float64); ok {
+						botCfg.CadenceMax = int(v)
+					}
 					botCfg.Unlock()
 				}
 			case "shutdown":
-				fmt.Println("[WEB] Comando de desligamento recebido!"); cancel()
+				fmt.Println("[WEB] Comando de desligamento recebido!")
+				cancel()
 			}
 		}
 	}

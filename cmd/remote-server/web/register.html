@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Argus - Criar Conta</title>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="connection-overlay" style="opacity: 1; pointer-events: auto;">
+        <div class="connection-box">
+            <h2>Criar Conta Argus</h2>
+            <p>Escolha seu nome de usuário e sua Agent Key.</p>
+            
+            <input type.text" id="username-input" placeholder="Nome de usuário (ex: paulo)" autocomplete="off" style="margin-bottom: 0.5rem;">
+            <input type="text" id="agent-key-input" placeholder="Sua Agent Key (ex: paulo_sk_123)" autocomplete="off">
+            
+            <button id="register-btn">Criar Conta</button>
+            
+            <p id="connection-status"></p> <p style="margin-top: 1rem; font-size: 0.9em;">
+                Já tem uma conta? <a href="/" style="color: var(--primary-color);">Faça login</a>.
+            </p>
+        </div>
+    </div>
+
+    <script src="register.js"></script>
+</body>
+</html>

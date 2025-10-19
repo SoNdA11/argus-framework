@@ -462,9 +462,71 @@ func handleDashboardConnections(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleRegisterRequest processa a criação de novos usuários.
+func handleRegisterRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 1. Decodificar o JSON vindo do frontend
+	var user User // Reutiliza a struct User já definida no seu main.go
+	if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+		http.Error(w, "JSON inválido", http.StatusBadRequest)
+		return
+	}
+
+	// 2. Validar input básico
+	if user.Username == "" || user.AgentKey == "" {
+		http.Error(w, "Usuário e AgentKey são obrigatórios", http.StatusBadRequest)
+		return
+	}
+
+	// 3. Conectar ao banco
+	collection := database.DB.Database("argus-db").Collection("users")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// 4. Verificar se o usuário ou a agentKey já existem
+	var existingUser User
+	err := collection.FindOne(ctx, bson.M{"$or": []bson.M{
+		{"username": user.Username},
+		{"agent_key": user.AgentKey},
+	}}).Decode(&existingUser)
+
+	// Se err == nil, significa que encontrou um documento, então o usuário já existe.
+	if err == nil {
+		http.Error(w, "Usuário ou AgentKey já cadastrado.", http.StatusConflict) // 409 Conflict
+		return
+	}
+	// Se o erro NÃO for "documento não encontrado", foi um erro real do DB
+	if err != mongo.ErrNoDocuments {
+		log.Printf("[REGISTER] Erro ao verificar usuário: %v", err)
+		http.Error(w, "Erro interno ao verificar usuário", http.StatusInternalServerError)
+		return
+	}
+
+	// 5. Inserir o novo usuário no banco
+	_, err = collection.InsertOne(ctx, user)
+	if err != nil {
+		log.Printf("[REGISTER] Erro ao criar usuário: %v", err)
+		http.Error(w, "Erro interno ao criar usuário", http.StatusInternalServerError)
+		return
+	}
+
+	// 6. Enviar resposta de sucesso
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated) // 201 Created
+	json.NewEncoder(w).Encode(map[string]string{"message": "Usuário criado com sucesso!"})
+	log.Printf("[REGISTER] Novo usuário criado: %s", user.Username)
+}
+
 func main() {
+
 	database.InitDB()
+
 	ctx, cancel := context.WithCancel(context.Background())
+
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -472,24 +534,40 @@ func main() {
 		log.Println("Sinal recebido, encerrando...")
 		cancel()
 	}()
+
+	http.HandleFunc("/register", handleRegisterRequest) 
+
 	http.HandleFunc("/agent", func(w http.ResponseWriter, r *http.Request) { handleAgentConnections(w, r, ctx) })
+
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) { handleDashboardConnections(w, r) })
+
 	http.Handle("/", http.FileServer(http.Dir("./cmd/remote-server/web")))
+
 	port := os.Getenv("PORT")
+
 	if port == "" {
 		port = "8080"
 	}
+
 	log.Printf("🚀 Servidor Remoto na porta %s...", port)
+
 	server := &http.Server{Addr: ":" + port}
+
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("ListenAndServe: %s", err)
 		}
 	}()
+
 	<-ctx.Done()
+
 	log.Println("Desligando servidor...")
+
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+
 	defer shutdownCancel()
+
 	server.Shutdown(shutdownCtx)
+
 	log.Println("Servidor encerrado.")
 }

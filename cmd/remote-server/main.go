@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
@@ -13,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"argus-framework/pkg/database" // Importado
+	"argus-framework/pkg/database"
 	"github.com/gorilla/websocket"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -24,6 +23,15 @@ type BotConfig struct {
 	sync.RWMutex
 	PowerMin, PowerMax, CadenceMin, CadenceMax int
 }
+
+type AttackConfig struct {
+	sync.RWMutex
+	Active   bool
+	Mode     string // "aditivo" or "percentual"
+	ValueMin int
+	ValueMax int
+}
+
 type UIState struct {
 	sync.RWMutex
 	MainMode       string
@@ -32,15 +40,20 @@ type UIState struct {
 	ModifiedPower  int
 	HeartRate      int
 	RealPower      int
+	CurrentBoostTarget int
+	NextBoostChangeTime time.Time
 }
+
 type AgentCommand struct {
 	Action  string                 `json:"action"`
 	Payload map[string]interface{} `json:"payload"`
 }
+
 type AgentEvent struct {
 	Event   string                 `json:"event"`
 	Payload map[string]interface{} `json:"payload"`
 }
+
 type User struct {
 	Username string `json:"username" bson:"username"`
 	AgentKey string `json:"agent_key" bson:"agent_key"`
@@ -53,6 +66,7 @@ type SessionManager struct {
 	Dashboards map[string]map[*websocket.Conn]bool
 	UserStates map[string]*UIState
 	BotConfigs map[string]*BotConfig
+	AttackConfigs map[string]*AttackConfig
 }
 
 // --- VARIÁVEIS GLOBAIS ---
@@ -63,10 +77,10 @@ var (
 		Dashboards: make(map[string]map[*websocket.Conn]bool),
 		UserStates: make(map[string]*UIState),
 		BotConfigs: make(map[string]*BotConfig),
+		AttackConfigs: make(map[string]*AttackConfig),
 	}
 )
 
-// +++ NOVO: (Fase 0.B) Função de validação da chave
 func isValidAgentKey(agentKey string) (bool, *User) {
 	if database.DB == nil {
 		log.Println("[AUTH] Erro: Conexão com o banco de dados não está disponível.")
@@ -215,174 +229,171 @@ func sendCommandToAgent(agentKey string, action string, payload map[string]inter
 	}
 }
 
+// --- handleAgentConnections (COM A CORREÇÃO DO SWITCH) ---
 func handleAgentConnections(w http.ResponseWriter, r *http.Request, mainCtx context.Context) {
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil { log.Printf("Erro no upgrade do agente: %v", err); return }
-
-	var authMsg map[string]string
-	if err := ws.ReadJSON(&authMsg); err != nil || authMsg["agent_key"] == "" {
-		log.Println("[SERVER] 🔌 Agente falhou na autenticação (mensagem malformada). Desconectando.")
-		ws.Close()
-		return
-	}
+	ws, err := upgrader.Upgrade(w, r, nil); if err != nil { log.Printf("Erro upgrade agente: %v", err); return }
+	var authMsg map[string]string; if err := ws.ReadJSON(&authMsg); err != nil || authMsg["agent_key"] == "" { log.Println("[SERVER] 🔌 Falha auth agente."); ws.Close(); return }
 	agentKey := authMsg["agent_key"]
-	
-	// --- MODIFICADO: (Fase 0.B) Verifica a chave no MongoDB
-	isValid, user := isValidAgentKey(agentKey)
-	if !isValid {
-		log.Printf("[SERVER] 🔌 Agente com chave INVÁLIDA (%s) tentou conectar. Desconectando.", agentKey)
-		ws.Close()
-		return
-	}
-	// --- Fim da modificação
+	isValid, user := isValidAgentKey(agentKey); if !isValid { log.Printf("[SERVER] 🔌 Chave inválida: %s", agentKey); ws.Close(); return }
 
 	sessionManager.Lock()
 	sessionManager.Agents[agentKey] = ws
+	// Inicializa todos os estados se for a primeira vez
 	if _, ok := sessionManager.UserStates[agentKey]; !ok {
-		sessionManager.UserStates[agentKey] = &UIState{MainMode: "bot"} // Inicia em modo bot por padrão
+		sessionManager.UserStates[agentKey] = &UIState{MainMode: "boost"}
 		sessionManager.BotConfigs[agentKey] = &BotConfig{PowerMin: 180, PowerMax: 220, CadenceMin: 85, CadenceMax: 95}
-		sessionManager.Dashboards[agentKey] = make(map[*websocket.Conn]bool)
+		sessionManager.AttackConfigs[agentKey] = &AttackConfig{Active: true, Mode: "aditivo", ValueMin: 30, ValueMax: 70}
+		sessionManager.Dashboards[agentKey] = make(map[*websocket.Conn]bool) // Corrigido
 	}
 	uiState := sessionManager.UserStates[agentKey]
+	attackCfg := sessionManager.AttackConfigs[agentKey]
 	uiState.AgentConnected = true
 	sessionManager.Unlock()
-	
+
 	log.Printf("[SERVER] ✅ Agente %s (Usuário: %s) conectado!", agentKey, user.Username)
 	sendCommandToAgent(agentKey, "start_virtual_trainer", map[string]interface{}{"name": "Argus Cloud Trainer"})
 
-	sessionCtx, cancel := context.WithCancel(mainCtx) 
+	sessionCtx, cancel := context.WithCancel(mainCtx)
 	go botLogicRoutine(sessionCtx, agentKey)
 	go broadcastToDashboards(sessionCtx, agentKey)
 
 	for {
 		var event AgentEvent
-		if err := ws.ReadJSON(&event); err != nil {
-			log.Println("[SERVER] 🔌 Agente", agentKey, "desconectado:", err)
-			break
-		}
-		
-		// --- MODIFICADO: (Fase 2) Adiciona handlers de eventos
+		if err := ws.ReadJSON(&event); err != nil { log.Println("[SERVER] 🔌 Agente", agentKey, "desconectado:", err); break }
+
 		switch event.Event {
 		case "app_status":
 			if connected, ok := event.Payload["connected"].(bool); ok {
 				uiState.Lock(); uiState.AppConnected = connected; uiState.Unlock()
-				if connected { log.Println("[SERVER] 📲 Agente", agentKey, "informou: App CONECTADO.") } else { log.Println("[SERVER] 📲 Agente", agentKey, "informou: App DESCONECTADO.") }
+				log.Printf("[SERVER] 📲 Agente %s: App %t.", agentKey, connected)
 			}
-		
+
 		case "trainer_data":
-			// (Fase 2) Dados recebidos do rolo real
 			if power, ok := event.Payload["real_power"].(float64); ok {
 				realPower := int(power)
-				uiState.Lock()
-				uiState.RealPower = realPower
-				currentMode := uiState.MainMode
-				uiState.Unlock()
+				modifiedPower := realPower // Começa com o valor real
 
-				// (Fase 4 - Preparação)
-				// Se não estivermos no modo "bot", calculamos a potência modificada aqui.
+				uiState.RLock(); currentMode := uiState.MainMode; uiState.RUnlock()
+
 				if currentMode == "boost" {
-					// TODO: Aplicar lógica de "boost" (aditivo/percentual)
-					// Por enquanto, apenas repassa (passthrough)
-					potenciaModificada := realPower 
-					
-					uiState.Lock(); uiState.ModifiedPower = potenciaModificada; uiState.Unlock()
-					sendCommandToAgent(agentKey, "send_power", map[string]interface{}{"watts": potenciaModificada})
-				
-				} // Se for modo "bot", a 'botLogicRoutine' está no controle.
+					attackCfg.RLock()
+					isActive, mode, vMin, vMax := attackCfg.Active, attackCfg.Mode, attackCfg.ValueMin, attackCfg.ValueMax
+					attackCfg.RUnlock()
+
+					// --- INÍCIO DA CORREÇÃO DO SWITCH ---
+					if isActive { // Verifica se o boost está ativo PRIMEIRO
+						uiState.Lock()
+						if time.Now().After(uiState.NextBoostChangeTime) {
+							if vMax > vMin { uiState.CurrentBoostTarget = rand.Intn(vMax-vMin+1) + vMin } else { uiState.CurrentBoostTarget = vMin }
+							randomInterval := rand.Intn(16) + 15
+							uiState.NextBoostChangeTime = time.Now().Add(time.Duration(randomInterval) * time.Second)
+							log.Printf("[BOOST %s] Novo alvo: %d (%s) por %ds", agentKey, uiState.CurrentBoostTarget, mode, randomInterval)
+						}
+						currentBoost := uiState.CurrentBoostTarget
+						uiState.Unlock()
+
+						// Usa o switch AQUI DENTRO para calcular o boost base
+						switch mode {
+						case "aditivo":
+							modifiedPower = realPower + currentBoost
+						case "percentual":
+							increase := float64(realPower) * (float64(currentBoost) / 100.0)
+							modifiedPower = realPower + int(increase)
+						// default: // Mantém modifiedPower = realPower se o modo for inválido
+						}
+
+						// Aplica o ruído DEPOIS do switch, mas ainda DENTRO do if isActive
+						if realPower > 0 {
+							ruido := rand.Intn(5) - 2
+							modifiedPower += ruido
+							if modifiedPower < 0 { modifiedPower = 0 }
+						}
+					}
+					// Se !isActive, modifiedPower continua sendo realPower
+					// --- FIM DA CORREÇÃO DO SWITCH ---
+				}
+
+				// Atualiza estado e envia comando (fora da lógica boost)
+				if currentMode != "bot" {
+					uiState.Lock(); uiState.RealPower = realPower; uiState.ModifiedPower = modifiedPower; uiState.Unlock()
+					sendCommandToAgent(agentKey, "send_power", map[string]interface{}{"watts": modifiedPower})
+				} else {
+					// Modo bot: Só atualiza RealPower para exibição no dashboard
+					uiState.Lock(); uiState.RealPower = realPower; uiState.Unlock()
+				}
 			}
-			// (Opcional: Adicionar "real_cadence" aqui)
 		}
 	}
-	
-	cancel() // Para as goroutines de bot e broadcast deste agente
+	cancel()
 	sessionManager.Lock()
 	delete(sessionManager.Agents, agentKey)
-	if uiState, ok := sessionManager.UserStates[agentKey]; ok {
-		uiState.AgentConnected = false
-		uiState.AppConnected = false
-		uiState.RealPower = 0 // Reseta a potência
-		uiState.ModifiedPower = 0
-	}
+	if uiState, ok := sessionManager.UserStates[agentKey]; ok { uiState.AgentConnected = false; uiState.AppConnected = false; uiState.RealPower = 0; uiState.ModifiedPower = 0 }
 	sessionManager.Unlock()
 }
 
-// handleDashboardConnections autentica e gerencia um dashboard web
+
+// --- handleDashboardConnections (COM A CORREÇÃO) ---
 func handleDashboardConnections(w http.ResponseWriter, r *http.Request, cancel context.CancelFunc) {
 	agentKey := "paulo_sk_123abc" // Placeholder
 
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println(err)
-		return
-	}
+	conn, err := upgrader.Upgrade(w, r, nil); if err != nil { log.Println(err); return }
 
 	sessionManager.Lock()
-	// +++ INÍCIO DA CORREÇÃO +++
-	// Garante que os mapas de estado existam, não importa quem conecte primeiro.
-	if _, ok := sessionManager.Dashboards[agentKey]; !ok {
-		sessionManager.Dashboards[agentKey] = make(map[*websocket.Conn]bool)
+	// Garante que os mapas existam
+	if _, ok := sessionManager.Dashboards[agentKey]; !ok { 
+		// +++ INÍCIO DA CORREÇÃO +++
+		// O tipo correto é 'map[*websocket.Conn]bool'
+		sessionManager.Dashboards[agentKey] = make(map[*websocket.Conn]bool) 
+		// +++ FIM DA CORREÇÃO +++
 	}
 	if _, ok := sessionManager.UserStates[agentKey]; !ok {
-		log.Printf("[SERVER] Inicializando estado para %s a partir da conexão do dashboard.", agentKey)
-		sessionManager.UserStates[agentKey] = &UIState{MainMode: "bot"}
+		log.Printf("[SERVER] Inicializando estado para %s (dashboard connect)", agentKey)
+		sessionManager.UserStates[agentKey] = &UIState{MainMode: "boost"}
 		sessionManager.BotConfigs[agentKey] = &BotConfig{PowerMin: 180, PowerMax: 220, CadenceMin: 85, CadenceMax: 95}
+		sessionManager.AttackConfigs[agentKey] = &AttackConfig{Active: true, Mode: "aditivo", ValueMin: 30, ValueMax: 70}
 	}
-	// +++ FIM DA CORREÇÃO +++
-
 	sessionManager.Dashboards[agentKey][conn] = true
 	sessionManager.Unlock()
-	log.Printf("[WEB] Novo dashboard conectado para o agente %s", agentKey)
+	log.Printf("[WEB] Novo dashboard conectado para %s", agentKey)
 
-	defer func() {
-		sessionManager.Lock()
-		delete(sessionManager.Dashboards[agentKey], conn)
-		sessionManager.Unlock()
-		conn.Close()
-		log.Printf("[WEB] Dashboard desconectado do agente %s", agentKey)
-	}()
+	defer func() { sessionManager.Lock(); delete(sessionManager.Dashboards[agentKey], conn); sessionManager.Unlock(); conn.Close(); log.Printf("[WEB] Dashboard desconectado de %s", agentKey) }()
 
 	for {
 		var msg map[string]interface{}
-		if err := conn.ReadJSON(&msg); err != nil {
-			break
-		}
-
-		log.Printf("[WEB] Comando recebido do dashboard: %v", msg)
+		if err := conn.ReadJSON(&msg); err != nil { break }
+		log.Printf("[WEB] Comando recebido dashboard: %v", msg)
 
 		if msgType, ok := msg["type"].(string); ok {
-			// Agora estas buscas são seguras, pois garantimos a inicialização acima
 			botCfg := sessionManager.BotConfigs[agentKey]
 			uiState := sessionManager.UserStates[agentKey]
+			attackCfg := sessionManager.AttackConfigs[agentKey]
 
 			switch msgType {
 			case "setMainMode":
 				if payload, ok := msg["payload"].(map[string]interface{}); ok {
-					if mode, ok := payload["mode"].(string); ok {
-						uiState.Lock()
-						uiState.MainMode = mode
-						uiState.Unlock()
-					}
+					if mode, ok := payload["mode"].(string); ok { uiState.Lock(); uiState.MainMode = mode; uiState.Unlock() }
 				}
 			case "setBotConfig":
 				if payload, ok := msg["payload"].(map[string]interface{}); ok {
 					botCfg.Lock()
-					if v, ok := payload["powerMin"].(float64); ok {
-						botCfg.PowerMin = int(v)
-					}
-					if v, ok := payload["powerMax"].(float64); ok {
-						botCfg.PowerMax = int(v)
-					}
-					if v, ok := payload["cadenceMin"].(float64); ok {
-						botCfg.CadenceMin = int(v)
-					}
-					if v, ok := payload["cadenceMax"].(float64); ok {
-						botCfg.CadenceMax = int(v)
-					}
+					if v, ok := payload["powerMin"].(float64); ok { botCfg.PowerMin = int(v) }
+					if v, ok := payload["powerMax"].(float64); ok { botCfg.PowerMax = int(v) }
+					if v, ok := payload["cadenceMin"].(float64); ok { botCfg.CadenceMin = int(v) }
+					if v, ok := payload["cadenceMax"].(float64); ok { botCfg.CadenceMax = int(v) }
 					botCfg.Unlock()
 				}
+			case "setPowerConfig":
+				if payload, ok := msg["payload"].(map[string]interface{}); ok {
+					attackCfg.Lock()
+					if active, ok := payload["active"].(bool); ok { attackCfg.Active = active }
+					if mode, ok := payload["mode"].(string); ok { attackCfg.Mode = mode }
+					if vMin, ok := payload["valueMin"].(float64); ok { attackCfg.ValueMin = int(vMin) }
+					if vMax, ok := payload["valueMax"].(float64); ok { attackCfg.ValueMax = int(vMax) }
+					attackCfg.Unlock()
+					log.Printf("[WEB] Configuração Boost atualizada para %s: %+v", agentKey, attackCfg)
+				}
 			case "shutdown":
-				fmt.Println("[WEB] Comando de desligamento recebido!")
-				cancel()
+				log.Println("[WEB] Comando shutdown recebido!"); cancel()
 			}
 		}
 	}

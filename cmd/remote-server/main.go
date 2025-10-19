@@ -229,34 +229,21 @@ func sendCommandToAgent(agentKey string, action string, payload map[string]inter
 	}
 }
 
-// --- handleAgentConnections (COM ENVIO DE MODO) ---
+// --- handleAgentConnections (COM A CORREÇÃO DO SWITCH) ---
 func handleAgentConnections(w http.ResponseWriter, r *http.Request, mainCtx context.Context) {
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("Erro upgrade agente: %v", err)
-		return
-	}
-	var authMsg map[string]string
-	if err := ws.ReadJSON(&authMsg); err != nil || authMsg["agent_key"] == "" {
-		log.Println("[SERVER] 🔌 Falha auth agente.")
-		ws.Close()
-		return
-	}
+	ws, err := upgrader.Upgrade(w, r, nil); if err != nil { log.Printf("Erro upgrade agente: %v", err); return }
+	var authMsg map[string]string; if err := ws.ReadJSON(&authMsg); err != nil || authMsg["agent_key"] == "" { log.Println("[SERVER] 🔌 Falha auth agente."); ws.Close(); return }
 	agentKey := authMsg["agent_key"]
-	isValid, user := isValidAgentKey(agentKey)
-	if !isValid {
-		log.Printf("[SERVER] 🔌 Chave inválida: %s", agentKey)
-		ws.Close()
-		return
-	}
+	isValid, user := isValidAgentKey(agentKey); if !isValid { log.Printf("[SERVER] 🔌 Chave inválida: %s", agentKey); ws.Close(); return }
 
 	sessionManager.Lock()
 	sessionManager.Agents[agentKey] = ws
+	// Inicializa todos os estados se for a primeira vez
 	if _, ok := sessionManager.UserStates[agentKey]; !ok {
 		sessionManager.UserStates[agentKey] = &UIState{MainMode: "boost"}
 		sessionManager.BotConfigs[agentKey] = &BotConfig{PowerMin: 180, PowerMax: 220, CadenceMin: 85, CadenceMax: 95}
 		sessionManager.AttackConfigs[agentKey] = &AttackConfig{Active: true, Mode: "aditivo", ValueMin: 30, ValueMax: 70}
-		sessionManager.Dashboards[agentKey] = make(map[*websocket.Conn]bool)
+		sessionManager.Dashboards[agentKey] = make(map[*websocket.Conn]bool) // Corrigido
 	}
 	uiState := sessionManager.UserStates[agentKey]
 	attackCfg := sessionManager.AttackConfigs[agentKey]
@@ -264,59 +251,40 @@ func handleAgentConnections(w http.ResponseWriter, r *http.Request, mainCtx cont
 	sessionManager.Unlock()
 
 	log.Printf("[SERVER] ✅ Agente %s (Usuário: %s) conectado!", agentKey, user.Username)
-
-	// +++ ADICIONADO: Envia o modo atual assim que o agente conecta +++
-	uiState.RLock()
-	currentModeOnConnect := uiState.MainMode
-	uiState.RUnlock()
-	log.Printf("[SERVER] Enviando modo inicial '%s' para o agente %s.", currentModeOnConnect, agentKey)
-	sendCommandToAgent(agentKey, "set_mode", map[string]interface{}{"mode": currentModeOnConnect})
-	// +++ FIM DA ADIÇÃO +++
-
 	sendCommandToAgent(agentKey, "start_virtual_trainer", map[string]interface{}{"name": "Argus Cloud Trainer"})
 
 	sessionCtx, cancel := context.WithCancel(mainCtx)
 	go botLogicRoutine(sessionCtx, agentKey)
 	go broadcastToDashboards(sessionCtx, agentKey)
 
-	for { // Loop de leitura do agente
+	for {
 		var event AgentEvent
-		if err := ws.ReadJSON(&event); err != nil {
-			log.Println("[SERVER] 🔌 Agente", agentKey, "desconectado:", err)
-			break
-		}
+		if err := ws.ReadJSON(&event); err != nil { log.Println("[SERVER] 🔌 Agente", agentKey, "desconectado:", err); break }
 
 		switch event.Event {
 		case "app_status":
 			if connected, ok := event.Payload["connected"].(bool); ok {
-				uiState.Lock()
-				uiState.AppConnected = connected
-				uiState.Unlock()
+				uiState.Lock(); uiState.AppConnected = connected; uiState.Unlock()
 				log.Printf("[SERVER] 📲 Agente %s: App %t.", agentKey, connected)
 			}
 
 		case "trainer_data":
 			if power, ok := event.Payload["real_power"].(float64); ok {
 				realPower := int(power)
-				modifiedPower := realPower
+				modifiedPower := realPower // Começa com o valor real
 
-				uiState.RLock()
-				currentMode := uiState.MainMode
-				uiState.RUnlock()
+				uiState.RLock(); currentMode := uiState.MainMode; uiState.RUnlock()
 
 				if currentMode == "boost" {
 					attackCfg.RLock()
 					isActive, mode, vMin, vMax := attackCfg.Active, attackCfg.Mode, attackCfg.ValueMin, attackCfg.ValueMax
 					attackCfg.RUnlock()
 
-					if isActive {
+					// --- INÍCIO DA CORREÇÃO DO SWITCH ---
+					if isActive { // Verifica se o boost está ativo PRIMEIRO
 						uiState.Lock()
 						if time.Now().After(uiState.NextBoostChangeTime) {
-							if vMax > vMin {
-								uiState.CurrentBoostTarget = rand.Intn(vMax-vMin+1) + vMin
-							} else {
-								uiState.CurrentBoostTarget = vMin
-							}
+							if vMax > vMin { uiState.CurrentBoostTarget = rand.Intn(vMax-vMin+1) + vMin } else { uiState.CurrentBoostTarget = vMin }
 							randomInterval := rand.Intn(16) + 15
 							uiState.NextBoostChangeTime = time.Now().Add(time.Duration(randomInterval) * time.Second)
 							log.Printf("[BOOST %s] Novo alvo: %d (%s) por %ds", agentKey, uiState.CurrentBoostTarget, mode, randomInterval)
@@ -324,34 +292,34 @@ func handleAgentConnections(w http.ResponseWriter, r *http.Request, mainCtx cont
 						currentBoost := uiState.CurrentBoostTarget
 						uiState.Unlock()
 
+						// Usa o switch AQUI DENTRO para calcular o boost base
 						switch mode {
 						case "aditivo":
 							modifiedPower = realPower + currentBoost
 						case "percentual":
 							increase := float64(realPower) * (float64(currentBoost) / 100.0)
 							modifiedPower = realPower + int(increase)
+						// default: // Mantém modifiedPower = realPower se o modo for inválido
 						}
 
+						// Aplica o ruído DEPOIS do switch, mas ainda DENTRO do if isActive
 						if realPower > 0 {
 							ruido := rand.Intn(5) - 2
 							modifiedPower += ruido
-							if modifiedPower < 0 {
-								modifiedPower = 0
-							}
+							if modifiedPower < 0 { modifiedPower = 0 }
 						}
 					}
+					// Se !isActive, modifiedPower continua sendo realPower
+					// --- FIM DA CORREÇÃO DO SWITCH ---
 				}
 
+				// Atualiza estado e envia comando (fora da lógica boost)
 				if currentMode != "bot" {
-					uiState.Lock()
-					uiState.RealPower = realPower
-					uiState.ModifiedPower = modifiedPower
-					uiState.Unlock()
+					uiState.Lock(); uiState.RealPower = realPower; uiState.ModifiedPower = modifiedPower; uiState.Unlock()
 					sendCommandToAgent(agentKey, "send_power", map[string]interface{}{"watts": modifiedPower})
 				} else {
-					uiState.Lock()
-					uiState.RealPower = realPower
-					uiState.Unlock()
+					// Modo bot: Só atualiza RealPower para exibição no dashboard
+					uiState.Lock(); uiState.RealPower = realPower; uiState.Unlock()
 				}
 			}
 		}
@@ -359,27 +327,24 @@ func handleAgentConnections(w http.ResponseWriter, r *http.Request, mainCtx cont
 	cancel()
 	sessionManager.Lock()
 	delete(sessionManager.Agents, agentKey)
-	if uiState, ok := sessionManager.UserStates[agentKey]; ok {
-		uiState.AgentConnected = false
-		uiState.AppConnected = false
-		uiState.RealPower = 0
-		uiState.ModifiedPower = 0
-	}
+	if uiState, ok := sessionManager.UserStates[agentKey]; ok { uiState.AgentConnected = false; uiState.AppConnected = false; uiState.RealPower = 0; uiState.ModifiedPower = 0 }
 	sessionManager.Unlock()
 }
 
-// --- handleDashboardConnections (COM ENVIO DE MODO) ---
+
+// --- handleDashboardConnections (COM A CORREÇÃO) ---
 func handleDashboardConnections(w http.ResponseWriter, r *http.Request, cancel context.CancelFunc) {
-	agentKey := "paulo_sk_123abc"
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println(err)
-		return
-	}
+	agentKey := "paulo_sk_123abc" // Placeholder
+
+	conn, err := upgrader.Upgrade(w, r, nil); if err != nil { log.Println(err); return }
 
 	sessionManager.Lock()
-	if _, ok := sessionManager.Dashboards[agentKey]; !ok {
-		sessionManager.Dashboards[agentKey] = make(map[*websocket.Conn]bool)
+	// Garante que os mapas existam
+	if _, ok := sessionManager.Dashboards[agentKey]; !ok { 
+		// +++ INÍCIO DA CORREÇÃO +++
+		// O tipo correto é 'map[*websocket.Conn]bool'
+		sessionManager.Dashboards[agentKey] = make(map[*websocket.Conn]bool) 
+		// +++ FIM DA CORREÇÃO +++
 	}
 	if _, ok := sessionManager.UserStates[agentKey]; !ok {
 		log.Printf("[SERVER] Inicializando estado para %s (dashboard connect)", agentKey)
@@ -391,19 +356,11 @@ func handleDashboardConnections(w http.ResponseWriter, r *http.Request, cancel c
 	sessionManager.Unlock()
 	log.Printf("[WEB] Novo dashboard conectado para %s", agentKey)
 
-	defer func() {
-		sessionManager.Lock()
-		delete(sessionManager.Dashboards[agentKey], conn)
-		sessionManager.Unlock()
-		conn.Close()
-		log.Printf("[WEB] Dashboard desconectado de %s", agentKey)
-	}()
+	defer func() { sessionManager.Lock(); delete(sessionManager.Dashboards[agentKey], conn); sessionManager.Unlock(); conn.Close(); log.Printf("[WEB] Dashboard desconectado de %s", agentKey) }()
 
 	for {
 		var msg map[string]interface{}
-		if err := conn.ReadJSON(&msg); err != nil {
-			break
-		}
+		if err := conn.ReadJSON(&msg); err != nil { break }
 		log.Printf("[WEB] Comando recebido dashboard: %v", msg)
 
 		if msgType, ok := msg["type"].(string); ok {
@@ -414,15 +371,7 @@ func handleDashboardConnections(w http.ResponseWriter, r *http.Request, cancel c
 			switch msgType {
 			case "setMainMode":
 				if payload, ok := msg["payload"].(map[string]interface{}); ok {
-					if mode, ok := payload["mode"].(string); ok {
-						uiState.Lock()
-						uiState.MainMode = mode
-						uiState.Unlock()
-						// +++ ADICIONADO: Envia a mudança de modo para o agente +++
-						log.Printf("[SERVER] Enviando mudança de modo '%s' para o agente %s.", mode, agentKey)
-						sendCommandToAgent(agentKey, "set_mode", map[string]interface{}{"mode": mode})
-						// +++ FIM DA ADIÇÃO +++
-					}
+					if mode, ok := payload["mode"].(string); ok { uiState.Lock(); uiState.MainMode = mode; uiState.Unlock() }
 				}
 			case "setBotConfig":
 				if payload, ok := msg["payload"].(map[string]interface{}); ok {
@@ -444,13 +393,11 @@ func handleDashboardConnections(w http.ResponseWriter, r *http.Request, cancel c
 					log.Printf("[WEB] Configuração Boost atualizada para %s: %+v", agentKey, attackCfg)
 				}
 			case "shutdown":
-				log.Println("[WEB] Comando shutdown recebido!")
-				cancel()
+				log.Println("[WEB] Comando shutdown recebido!"); cancel()
 			}
 		}
 	}
 }
-
 
 func main() {
 	// CORREÇÃO 1: 'ctx' agora é '_' porque só usamos 'cancel'

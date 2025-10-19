@@ -4,8 +4,6 @@ package ble
 import (
 	"strings"
 	"sync"
-	"time"
-	
 	"github.com/go-ble/ble"
 )
 
@@ -35,11 +33,6 @@ type UIState struct {
 	RealPower       int  // Potência lida do rolo real.
 	ModifiedPower   int  // Potência final enviada para o app.
 	HeartRate       int  // Frequência cardíaca simulada.
-	RealCadence     int  //	Cadência lida do rolo real
-	MainMode        string // +++ ADICIONADO: "boost" ou "bot"
-	// Para lógica de boost dinâmico
-	CurrentBoostTarget  int
-	NextBoostChangeTime time.Time
 }
 
 // --- CONSTANTES E UUIDs BLE ---

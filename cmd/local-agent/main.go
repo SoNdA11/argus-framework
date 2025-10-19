@@ -88,10 +88,66 @@ func localServerRoutine(ctx context.Context, cfg *config.AppConfig, powerChan <-
 	cscChar.HandleNotify(blelib.NotifyHandlerFunc(func(req blelib.Request, ntf blelib.Notifier) {
 		log.Printf("[AGENT-SRV] ✅ App %s inscrito Cadência.", req.Conn().RemoteAddr())
 		defer log.Printf("[AGENT-SRV] 🔌 App %s desinscrito Cadência.", req.Conn().RemoteAddr())
-		var cumRevs uint16; var lastEvtTime uint16; ticker := time.NewTicker(250*time.Millisecond); defer ticker.Stop(); var target int
-		for { select { case <-ctx.Done(): return; case <-ntf.Context().Done(): return; case newTarget := <-cadenceChan: target = newTarget
-			case <-ticker.C: if target <= 0 { continue }; revs := float64(target)/60.0/4.0; cumRevs += uint16(revs); lastEvtTime += (1024/4); flags := byte(0x02); buf := new(bytes.Buffer); binary.Write(buf, binary.LittleEndian, flags); binary.Write(buf, binary.LittleEndian, cumRevs); binary.Write(buf, binary.LittleEndian, lastEvtTime); if _, err := ntf.Write(buf.Bytes()); err != nil { return }
-		}}
+
+		// --- INÍCIO LÓGICA DE CADÊNCIA (Adaptada de pkg/ble/server.go) ---
+		var cumulativeRevolutions uint32 // Usa uint32 para evitar overflow rápido
+		var lastCrankEventTime uint16 // Timestamp em 1/1024s
+		var timeOfNextRevolution time.Time // Controla quando enviar a próxima notificação
+		var currentCadenceTarget int // Cadência alvo atual vinda do servidor
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ntf.Context().Done():
+				return
+			case newTarget := <-cadenceChan: // Atualiza o alvo quando recebe comando
+				currentCadenceTarget = newTarget
+				// Se a cadência mudar para > 0, força um cálculo imediato do próximo evento
+				if currentCadenceTarget > 0 && timeOfNextRevolution.IsZero() {
+					timeOfNextRevolution = time.Now()
+				}
+			// Usa time.After para verificar se já é hora de enviar, sem bloquear
+			case <-time.After(50 * time.Millisecond): // Verifica a cada 50ms
+				// Se cadência alvo é 0 ou ainda não chegou a hora, não faz nada
+				if currentCadenceTarget <= 0 || time.Now().Before(timeOfNextRevolution) {
+					continue
+				}
+
+				// --- É hora de registrar uma revolução ---
+				cumulativeRevolutions++
+
+				// Calcula o timestamp do evento atual (em unidades de 1/1024s)
+				// Usamos o tempo atual como base
+				nowNano := time.Now().UnixNano()
+				lastCrankEventTime = uint16(nowNano / 1e6 * 1024 / 1000) // Convertendo ms para 1/1024s
+
+				// Prepara o pacote CSC Measurement (Flag 0x02 indica dados de Crank Revolution)
+				flags := byte(0x02)
+				buf := new(bytes.Buffer)
+				binary.Write(buf, binary.LittleEndian, flags)
+				binary.Write(buf, binary.LittleEndian, uint16(cumulativeRevolutions & 0xFFFF)) // Envia apenas os 16 bits inferiores
+				binary.Write(buf, binary.LittleEndian, lastCrankEventTime)
+
+				// Envia a notificação para o app (Zwift)
+				_, err := ntf.Write(buf.Bytes())
+				if err != nil {
+					log.Printf("[AGENT-SRV] Erro envio cadência: %v", err)
+					return // Sai se houver erro de escrita
+				}
+				log.Printf("[CAD] Enviado: RPM=%d, Revs=%d, Time=%d", currentCadenceTarget, cumulativeRevolutions, lastCrankEventTime) // Log de debug (opcional)
+
+
+				// Calcula o tempo da PRÓXIMA revolução com base na cadência alvo atual
+				intervalSeconds := 60.0 / float64(currentCadenceTarget)
+				intervalDuration := time.Duration(intervalSeconds * float64(time.Second))
+				timeOfNextRevolution = time.Now().Add(intervalDuration)
+
+				// Limita a taxa de envio para evitar flood (opcional, mas bom)
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+		// --- FIM LÓGICA DE CADÊNCIA ---
 	}))
 
 	d.AddService(powerSvc); d.AddService(cscSvc); d.AddService(blelib.NewService(ble.FTMSSvcUUID))

@@ -50,17 +50,46 @@ body {
 }
 .connection-box h2 { margin-top: 0; }
 .connection-box p { opacity: 0.8; }
-#agent-key-input {
+
+/* --- MUDANÇA IMPLEMENTADA AQUI ---
+   Removida a regra antiga "#agent-key-input"
+   Adicionada a regra genérica "input[type="text"]"
+*/
+input[type="text"] {
     width: 100%;
     padding: 0.8rem;
-    margin: 1rem 0;
-    background-color: rgba(255,255,255,0.05);
-    border: 1px solid var(--border-color);
+    margin-bottom: 1rem; /* Espaçamento entre os campos */
+    
+    /* Aparência */
+    background-color: rgba(10, 13, 20, 0.9); /* Fundo escuro */
+    border: 1px solid var(--border-color);   /* Borda neon sutil */
+    border-radius: 4px;
+    
+    /* Texto */
     color: var(--text-color);
     font-family: 'Roboto Mono', monospace;
-    text-align: center;
-    border-radius: 4px;
+    font-size: 1rem;
+    text-align: left; /* IMPORTANTE: Alinha o texto à esquerda */
+
+    /* Comportamento */
+    outline: none; /* Remove a borda azul padrão do navegador */
+    transition: border-color 0.3s ease, box-shadow 0.3s ease;
 }
+
+/* Efeito de FOCO quando o usuário clica na caixa */
+input[type="text"]:focus {
+    border-color: var(--primary-color); /* A borda fica mais brilhante */
+    /* Adiciona o "brilho" (glow) sutil */
+    box-shadow: 0 0 10px rgba(0, 255, 204, 0.5); 
+}
+
+/* Remove a margem de baixo do último input (para não dar espaço extra antes do botão) */
+.connection-box input[type="text"]:last-of-type {
+    margin-bottom: 0.5rem;
+}
+/* --- FIM DA MUDANÇA --- */
+
+
 #connect-btn {
     width: 100%;
     padding: 0.8rem;
@@ -73,11 +102,17 @@ body {
     text-transform: uppercase;
     cursor: pointer;
     transition: all 0.2s ease;
+    margin-top: 1rem; /* Adiciona espaço acima do botão */
 }
 #connect-btn:hover { box-shadow: 0 0 15px var(--primary-color); }
 #connection-status { margin-top: 1rem; min-height: 1.2em; color: var(--secondary-color); }
 
-/* --- CONTEÚDO PRINCIPAL --- */
+/* Classes de status (para o JS usar) */
+#connection-status.connected { color: var(--connected-color); }
+#connection-status.disconnected { color: var(--disconnected-color); }
+
+
+/* --- CONTEÚDO PRINCIPAL (Sem alterações) --- */
 .container { width: 96%; max-width: 1200px; background-color: rgba(10,13,20,0.8); border: 1px solid var(--border-color); padding: 1.5rem; box-shadow: 0 0 30px rgba(0,255,204,0.06); border-radius: 4px; }
 h1,h2 { color: var(--primary-color); text-transform: uppercase; text-shadow:0 0 6px var(--primary-color); }
 h1 { text-align: center; margin:0 0 1rem; font-size:1.4rem; }
@@ -121,4 +156,3 @@ body.bot-mode-active .boost-controls { display: none; }
 body.bot-mode-active .bot-controls { display: block; }
 body.bot-mode-active .data-box:first-child { opacity: 0.3; }
 @media (max-width: 980px) { .columns { flex-direction: column; } .sidebar, .main-panel { flex-basis: auto; min-width: auto; } .data-grid { grid-template-columns: repeat(1, 1fr); } }
-

@@ -65,96 +65,129 @@ func writePump(ctx context.Context, c *websocket.Conn, writeChan <-chan interfac
 	}
 }
 
-// --- NOVA: localServerRoutine (Adaptada de pkg/ble/server.go) ---
-// Recebe canais para potência/cadência do WebSocket
-func localServerRoutine(ctx context.Context, cfg *config.AppConfig, powerChan <-chan int, cadenceChan <-chan int, writeChan chan<- interface{}, wg *sync.WaitGroup) {
+// Agora a leitura de uiState.MainMode funcionará.
+func localServerRoutine(ctx context.Context, cfg *config.AppConfig, uiState *ble.UIState, powerChan <-chan int, cadenceChan <-chan int, writeChan chan<- interface{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 	log.Printf("[AGENT-SRV] Iniciando rolo virtual no adaptador hci%d...", cfg.ServerAdapterID)
 	d, err := linux.NewDevice(blelib.OptDeviceID(cfg.ServerAdapterID))
-	if err != nil { log.Printf("[AGENT-SRV] ❌ Falha adaptador: %s", err); writeChan <- AgentEvent{"error", map[string]interface{}{"message": err.Error()}}; return }
-	// NÃO define DefaultDevice
+	if err != nil {
+		log.Printf("[AGENT-SRV] ❌ Falha adaptador: %s", err)
+		writeChan <- AgentEvent{"error", map[string]interface{}{"message": err.Error()}}
+		return
+	}
 
-	powerSvc := blelib.NewService(ble.PowerSvcUUID); powerChar := powerSvc.NewCharacteristic(ble.PowerCharUUID)
+	powerSvc := blelib.NewService(ble.PowerSvcUUID)
+	powerChar := powerSvc.NewCharacteristic(ble.PowerCharUUID)
 	powerChar.HandleNotify(blelib.NotifyHandlerFunc(func(req blelib.Request, ntf blelib.Notifier) {
 		log.Printf("[AGENT-SRV] ✅ App %s inscrito Potência.", req.Conn().RemoteAddr())
-		writeChan <- AgentEvent{"app_status", map[string]interface{}{"connected": true}}
-		defer func() { log.Printf("[AGENT-SRV] 🔌 App %s desinscrito Potência.", req.Conn().RemoteAddr()); writeChan <- AgentEvent{"app_status", map[string]interface{}{"connected": false}} }()
-		for { select { case <-ctx.Done(): return; case <-ntf.Context().Done(): return
-			case watts := <-powerChan: pBytes := make([]byte, 4); binary.LittleEndian.PutUint16(pBytes[2:4], uint16(watts)); if _, err := ntf.Write(pBytes); err != nil { log.Printf("[AGENT-SRV] Erro envio potência: %v", err); return }
-		}}
-	}))
-
-	cscSvc := blelib.NewService(ble.CSCSvcUUID); cscChar := cscSvc.NewCharacteristic(ble.CSCMeasurementCharUUID)
-	cscChar.HandleNotify(blelib.NotifyHandlerFunc(func(req blelib.Request, ntf blelib.Notifier) {
-		log.Printf("[AGENT-SRV] ✅ App %s inscrito Cadência.", req.Conn().RemoteAddr())
-		defer log.Printf("[AGENT-SRV] 🔌 App %s desinscrito Cadência.", req.Conn().RemoteAddr())
-
-		// --- INÍCIO LÓGICA DE CADÊNCIA (Adaptada de pkg/ble/server.go) ---
-		var cumulativeRevolutions uint32 // Usa uint32 para evitar overflow rápido
-		var lastCrankEventTime uint16 // Timestamp em 1/1024s
-		var timeOfNextRevolution time.Time // Controla quando enviar a próxima notificação
-		var currentCadenceTarget int // Cadência alvo atual vinda do servidor
-
+		select {
+		case writeChan <- AgentEvent{"app_status", map[string]interface{}{"connected": true}}:
+		default:
+		}
+		defer func() {
+			log.Printf("[AGENT-SRV] 🔌 App %s desinscrito Potência.", req.Conn().RemoteAddr())
+			select {
+			case writeChan <- AgentEvent{"app_status", map[string]interface{}{"connected": false}}:
+			default:
+			}
+		}()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ntf.Context().Done():
 				return
-			case newTarget := <-cadenceChan: // Atualiza o alvo quando recebe comando
-				currentCadenceTarget = newTarget
-				// Se a cadência mudar para > 0, força um cálculo imediato do próximo evento
-				if currentCadenceTarget > 0 && timeOfNextRevolution.IsZero() {
+			case watts := <-powerChan:
+				pBytes := make([]byte, 4)
+				binary.LittleEndian.PutUint16(pBytes[2:4], uint16(watts))
+				if _, err := ntf.Write(pBytes); err != nil {
+					log.Printf("[AGENT-SRV] Erro envio potência: %v", err)
+					return
+				}
+			}
+		}
+	}))
+
+	cscSvc := blelib.NewService(ble.CSCSvcUUID)
+	cscChar := cscSvc.NewCharacteristic(ble.CSCMeasurementCharUUID)
+	cscChar.HandleNotify(blelib.NotifyHandlerFunc(func(req blelib.Request, ntf blelib.Notifier) {
+		log.Printf("[AGENT-SRV] ✅ App %s inscrito Cadência.", req.Conn().RemoteAddr())
+		defer log.Printf("[AGENT-SRV] 🔌 App %s desinscrito Cadência.", req.Conn().RemoteAddr())
+		var cumulativeRevolutions uint32
+		var lastCrankEventTime uint16
+		var timeOfNextRevolution time.Time
+		var currentCadenceTarget int
+		var lastBotTarget int
+
+		for {
+			uiState.RLock()
+			currentMode := uiState.MainMode // Esta linha agora compila
+			realCadence := uiState.RealCadence
+			uiState.RUnlock()
+
+			if currentMode == "boost" {
+				if realCadence >= 0 {
+					currentCadenceTarget = realCadence
+				} else {
+					currentCadenceTarget = 0
+				}
+			} else { // modo "bot"
+				select {
+				case botTarget := <-cadenceChan:
+					currentCadenceTarget = botTarget
+					lastBotTarget = botTarget
+				default:
+					currentCadenceTarget = lastBotTarget
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-ntf.Context().Done():
+				return
+			case <-time.After(50 * time.Millisecond):
+				if currentCadenceTarget <= 0 {
+					timeOfNextRevolution = time.Time{}
+					continue
+				}
+				if timeOfNextRevolution.IsZero() {
 					timeOfNextRevolution = time.Now()
 				}
-			// Usa time.After para verificar se já é hora de enviar, sem bloquear
-			case <-time.After(50 * time.Millisecond): // Verifica a cada 50ms
-				// Se cadência alvo é 0 ou ainda não chegou a hora, não faz nada
-				if currentCadenceTarget <= 0 || time.Now().Before(timeOfNextRevolution) {
+				if time.Now().Before(timeOfNextRevolution) {
 					continue
 				}
 
-				// --- É hora de registrar uma revolução ---
 				cumulativeRevolutions++
-
-				// Calcula o timestamp do evento atual (em unidades de 1/1024s)
-				// Usamos o tempo atual como base
 				nowNano := time.Now().UnixNano()
-				lastCrankEventTime = uint16(nowNano / 1e6 * 1024 / 1000) // Convertendo ms para 1/1024s
+				lastCrankEventTime = uint16(nowNano / 1e6 * 1024 / 1000)
 
-				// Prepara o pacote CSC Measurement (Flag 0x02 indica dados de Crank Revolution)
 				flags := byte(0x02)
 				buf := new(bytes.Buffer)
 				binary.Write(buf, binary.LittleEndian, flags)
-				binary.Write(buf, binary.LittleEndian, uint16(cumulativeRevolutions & 0xFFFF)) // Envia apenas os 16 bits inferiores
+				binary.Write(buf, binary.LittleEndian, uint16(cumulativeRevolutions&0xFFFF))
 				binary.Write(buf, binary.LittleEndian, lastCrankEventTime)
 
-				// Envia a notificação para o app (Zwift)
-				_, err := ntf.Write(buf.Bytes())
-				if err != nil {
+				if _, err := ntf.Write(buf.Bytes()); err != nil {
 					log.Printf("[AGENT-SRV] Erro envio cadência: %v", err)
-					return // Sai se houver erro de escrita
+					return
 				}
-				log.Printf("[CAD] Enviado: RPM=%d, Revs=%d, Time=%d", currentCadenceTarget, cumulativeRevolutions, lastCrankEventTime) // Log de debug (opcional)
-
-
-				// Calcula o tempo da PRÓXIMA revolução com base na cadência alvo atual
-				intervalSeconds := 60.0 / float64(currentCadenceTarget)
-				intervalDuration := time.Duration(intervalSeconds * float64(time.Second))
-				timeOfNextRevolution = time.Now().Add(intervalDuration)
-
-				// Limita a taxa de envio para evitar flood (opcional, mas bom)
-				time.Sleep(50 * time.Millisecond)
+				// log.Printf("[CAD %s] Enviado: RPM=%d", currentMode, currentCadenceTarget)
 			}
 		}
-		// --- FIM LÓGICA DE CADÊNCIA ---
 	}))
 
-	d.AddService(powerSvc); d.AddService(cscSvc); d.AddService(blelib.NewService(ble.FTMSSvcUUID))
+	d.AddService(powerSvc)
+	d.AddService(cscSvc)
+	d.AddService(blelib.NewService(ble.FTMSSvcUUID))
 	log.Printf("[AGENT-SRV] 📣 Anunciando como '%s'...", cfg.VirtualTrainerName)
-	if err = d.AdvertiseNameAndServices(ctx, cfg.VirtualTrainerName, ble.PowerSvcUUID, ble.FTMSSvcUUID, ble.CSCSvcUUID); err != nil { log.Printf("[AGENT-SRV] Erro anunciar: %v", err) }
+	if err = d.AdvertiseNameAndServices(ctx, cfg.VirtualTrainerName, ble.PowerSvcUUID, ble.FTMSSvcUUID, ble.CSCSvcUUID); err != nil {
+		log.Printf("[AGENT-SRV] Erro anunciar: %v", err)
+	}
 	log.Println("[AGENT-SRV] Anúncio parado.")
 }
+
+
 
 
 // --- NOVA: dataBridge ---
@@ -187,55 +220,60 @@ func dataBridge(ctx context.Context, uiState *ble.UIState, writeChan chan<- inte
 }
 
 
-// --- Main ---
 func main() {
 	agentKey := flag.String("key", "", "Chave API")
 	trainerMAC := flag.String("mac", "", "MAC Rolo Real")
 	flag.Parse()
-	if *agentKey == "" { log.Fatal("❌ --key obrigatória") }
-	if *trainerMAC == "" { log.Println("⚠️ Aviso: --mac não fornecido. Apenas o rolo virtual funcionará.")}
-
+	if *agentKey == "" {
+		log.Fatal("❌ --key obrigatória")
+	}
 	addr := "wss://argus-remote-server.onrender.com/agent"
-
 	clientAdapterID, serverAdapterID, err := discoverAdapters()
-	if err != nil { log.Fatalf("❌ %v", err) }
-
+	if err != nil {
+		log.Fatalf("❌ %v", err)
+	}
 	log.Printf("[AGENT] Iniciando... Cliente(hci%d) -> Servidor(hci%d)", clientAdapterID, serverAdapterID)
-	interrupt := make(chan os.Signal, 1); signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
-	ctx, cancel := context.WithCancel(context.Background()); go func() { <-interrupt; log.Println("Encerrando..."); cancel() }()
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-interrupt; log.Println("Encerrando..."); cancel() }()
 
-	// Canais para comandos vindos do WebSocket para o Servidor BLE local
 	powerChan := make(chan int, 10)
 	cadenceChan := make(chan int, 10)
+	uiState := &ble.UIState{}
 
-	// Estado local compartilhado (principalmente para Client -> Bridge)
-	uiState := &ble.UIState{} // Usando o UIState do pacote pkg/ble
-
-	for { // Loop de conexão WebSocket
-		if ctx.Err() != nil { log.Println("Contexto cancelado. Saindo."); return }
+	for {
+		if ctx.Err() != nil {
+			log.Println("Contexto cancelado. Saindo."); return
+		}
 		log.Printf("[AGENT] Conectando a %s", addr)
-		c, _, err := websocket.DefaultDialer.Dial(addr, nil); if err != nil { log.Println("❌ Falha WS:", err); time.Sleep(5 * time.Second); continue }
+		c, _, err := websocket.DefaultDialer.Dial(addr, nil)
+		if err != nil {
+			log.Println("❌ Falha WS:", err); time.Sleep(5 * time.Second); continue
+		}
 		log.Println("[AGENT] ✅ Conectado WS! Autenticando...")
-		authMsg := map[string]string{"agent_key": *agentKey}; if err := c.WriteJSON(authMsg); err != nil { log.Println("❌ Falha auth:", err); c.Close(); time.Sleep(5 * time.Second); continue }
+		authMsg := map[string]string{"agent_key": *agentKey}
+		if err := c.WriteJSON(authMsg); err != nil {
+			log.Println("❌ Falha auth:", err); c.Close(); time.Sleep(5 * time.Second); continue
+		}
 
-		writeChan := make(chan interface{}, 10);
-		done := make(chan struct{});
-		bleCtx, bleCancel := context.WithCancel(ctx) // Contexto para as goroutines BLE
-
+		writeChan := make(chan interface{}, 10)
+		done := make(chan struct{})
+		bleCtx, bleCancel := context.WithCancel(ctx)
 		go writePump(ctx, c, writeChan, done)
 
-		// Goroutine de leitura WS e disparo BLE
-		go func() {
-			defer func() { bleCancel(); close(done) }() // Garante cancelamento BLE e sinalização done
-
+		go func() { // Goroutine de leitura WS e disparo BLE
+			defer func() {
+				bleCancel()
+				close(done)
+			}()
 			bleStarted := false
-			var bleWg sync.WaitGroup // WaitGroup para esperar BLE terminar
-
+			var bleWg sync.WaitGroup
 			for {
 				var cmd AgentCommand
 				if err := c.ReadJSON(&cmd); err != nil {
 					log.Println("🔌 Erro leitura WS:", err)
-					bleWg.Wait() // Espera BLE terminar antes de sair
+					bleWg.Wait()
 					return
 				}
 
@@ -244,27 +282,23 @@ func main() {
 					if !bleStarted {
 						if name, ok := cmd.Payload["name"].(string); ok {
 							log.Println("[AGENT] Comando 'start_virtual_trainer' recebido.")
-
-							// Cria a configuração para as rotinas BLE
 							bleCfg := &config.AppConfig{
 								ClientAdapterID:    clientAdapterID,
 								ServerAdapterID:    serverAdapterID,
 								TrainerMAC:         *trainerMAC,
 								VirtualTrainerName: name,
 							}
-
-							// Cria um canal dummy para commandChan (não usado pelo ServerRoutine local)
 							dummyCommandChan := make(chan []byte)
 
-							// Inicia Cliente, Servidor e Bridge
-							bleWg.Add(3) // Espera 3 goroutines: Cliente, Servidor, Bridge
+							bleWg.Add(3)
+
 							log.Println("[AGENT] Iniciando Cliente BLE (pkg/ble)...")
-							go ble.ClientRoutine(bleCtx, bleCfg, dummyCommandChan, uiState, nil, &bleWg) // Passa nil para resistanceCfg
+
+							go ble.ClientRoutine(bleCtx, bleCfg, dummyCommandChan, uiState, nil, &bleWg) // readyChan não é mais necessário
 							log.Println("[AGENT] Iniciando Servidor BLE local...")
-							go localServerRoutine(bleCtx, bleCfg, powerChan, cadenceChan, writeChan, &bleWg)
+							go localServerRoutine(bleCtx, bleCfg, uiState, powerChan, cadenceChan, writeChan, &bleWg)
 							log.Println("[AGENT] Iniciando Ponte de Dados...")
 							go dataBridge(bleCtx, uiState, writeChan)
-
 							bleStarted = true
 						}
 					} else {
@@ -272,19 +306,38 @@ func main() {
 					}
 				case "send_power":
 					if watts, ok := cmd.Payload["watts"].(float64); ok {
-						select { case powerChan <- int(watts): default: log.Println("[AGENT] Aviso: powerChan cheio.") }
+						select {
+						case powerChan <- int(watts):
+						default:
+							log.Println("[AGENT] Aviso: powerChan cheio.")
+						}
 					}
 				case "send_cadence":
 					if rpm, ok := cmd.Payload["rpm"].(float64); ok {
-						select { case cadenceChan <- int(rpm): default: log.Println("[AGENT] Aviso: cadenceChan cheio.") }
+						select {
+						case cadenceChan <- int(rpm):
+						default:
+							log.Println("[AGENT] Aviso: cadenceChan cheio.")
+						}
 					}
+				// +++ ADICIONADO: Recebe e atualiza o modo +++
+				case "set_mode":
+					if mode, ok := cmd.Payload["mode"].(string); ok {
+						log.Printf("[AGENT] Modo recebido do servidor: %s", mode)
+						uiState.Lock()
+						uiState.MainMode = mode
+						uiState.Unlock()
+					}
+				// +++ FIM DA ADIÇÃO +++
 				}
 			}
 		}()
 
-		select { // Espera leitura WS falhar ou Ctrl+C
-		case <-done: log.Println("[AGENT] Conexão WS perdida. Reconectando...")
-		case <-ctx.Done(): log.Println("Sinal recebido. Fechando..."); time.Sleep(1 * time.Second); return
+		select {
+		case <-done:
+			log.Println("[AGENT] Conexão WS perdida. Reconectando...")
+		case <-ctx.Done():
+			log.Println("Sinal recebido. Fechando..."); time.Sleep(1 * time.Second); return
 		}
 	}
 }

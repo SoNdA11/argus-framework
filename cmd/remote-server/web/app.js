@@ -26,6 +26,13 @@ document.addEventListener("DOMContentLoaded", () => {
     const botCadenceMaxSlider = document.getElementById('bot-cadence-max');
     const botCadenceDisplay = document.getElementById('bot-cadence-display');
 
+    // NOVOS Elementos para Conexão
+    const connectionOverlay = document.getElementById('connection-overlay');
+    const agentKeyInput = document.getElementById('agent-key-input');
+    const connectButton = document.getElementById('connect-btn');
+    const connectionStatusEl = document.getElementById('connection-status');
+
+
     // --- GRÁFICO ---
     const chartCanvas = document.getElementById('powerChart');
     const powerChart = new Chart(chartCanvas, {

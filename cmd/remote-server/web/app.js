@@ -1,4 +1,5 @@
 document.addEventListener("DOMContentLoaded", () => {
+    // --- Seletores de Elementos (sem alterações) ---
     const body = document.body;
     const realPowerEl = document.getElementById('real-power');
     const modifiedPowerEl = document.getElementById('modified-power');
@@ -25,6 +26,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const connectButton = document.getElementById('connect-btn');
     const connectionStatusEl = document.getElementById('connection-status');
 
+    // --- GRÁFICO (sem alterações) ---
     const chartCanvas = document.getElementById('powerChart');
     const powerChart = new Chart(chartCanvas, {
         type: 'line',
@@ -47,38 +49,13 @@ document.addEventListener("DOMContentLoaded", () => {
             }]
         },
         options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: {
-                    labels: {
-                        color: '#cdd6f6'
-                    }
-                }
-            },
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { labels: { color: '#cdd6f6' } } },
             scales: {
-                y: {
-                    min: 0,
-                    suggestedMax: 400,
-                    grid: {
-                        color: 'rgba(0, 255, 204, 0.1)'
-                    },
-                    ticks: {
-                        color: '#cdd6f6'
-                    }
-                },
-                x: {
-                    grid: {
-                        display: false
-                    },
-                    ticks: {
-                        display: false
-                    }
-                }
+                y: { min: 0, suggestedMax: 400, grid: { color: 'rgba(0, 255, 204, 0.1)' }, ticks: { color: '#cdd6f6' } },
+                x: { grid: { display: false }, ticks: { display: false } }
             },
-            animation: {
-                duration: 0
-            },
+            animation: { duration: 0 },
         }
     });
 
@@ -94,22 +71,34 @@ document.addEventListener("DOMContentLoaded", () => {
         powerChart.update('quiet');
     }
 
+    // --- LÓGICA DO WEBSOCKET (CORRIGIDA) ---
     let socket;
 
+    // A função `connect` agora recebe a agentKey como argumento
     function connect(agentKey) {
         if (!agentKey) {
             connectionStatusEl.textContent = "A Agent Key não pode estar vazia.";
             return;
         }
-        connectionStatusEl.textContent = `A conectar com a chave: ${agentKey}...`;
+        connectionStatusEl.textContent = `A conectar à sessão: ${agentKey}...`;
+
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        // Constrói a URL com a agentKey como um parâmetro de consulta
         const socketURL = `${protocol}//${window.location.host}/ws?agentKey=${agentKey}`;
+        
         socket = new WebSocket(socketURL);
 
         socket.onopen = () => {
-            console.log("DASHBOARD CONECTADO");
+            console.log("DASHBOARD CONECTADO À SESSÃO " + agentKey);
             connectionStatusEl.textContent = "Conectado!";
-            connectionOverlay.style.display = 'none'; // Esconde a sobreposição
+            
+            // Esconde a tela de login após 1 segundo
+            setTimeout(() => {
+                connectionOverlay.style.opacity = '0';
+                connectionOverlay.style.pointerEvents = 'none';
+            }, 1000);
+            
+            // Envia as configurações iniciais
             handleMainModeChange();
             sendResistanceConfig();
         };
@@ -118,6 +107,7 @@ document.addEventListener("DOMContentLoaded", () => {
             const data = JSON.parse(event.data);
             if (data.type === 'statusUpdate') {
                 const isBotMode = body.classList.contains('bot-mode-active');
+                
                 realPowerEl.textContent = isBotMode ? '---' : (data.realPower != null ? data.realPower : '---');
                 modifiedPowerEl.textContent = data.modifiedPower != null ? data.modifiedPower : '---';
                 heartRateEl.textContent = data.heartRate || '--';
@@ -131,138 +121,53 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         };
 
-        socket.onclose = () => {
-            console.log("DASHBOARD DESCONECTADO.");
-            connectionStatusEl.textContent = "Desconectado. Pressione F5 para tentar novamente.";
-            connectionOverlay.style.display = 'flex';
+        socket.onclose = (event) => {
+            console.log("DASHBOARD DESCONECTADO.", event.reason);
+            connectionStatusEl.textContent = event.reason || "Desconectado. Pressione F5 para tentar novamente.";
+            connectionOverlay.style.opacity = '1';
+            connectionOverlay.style.pointerEvents = 'auto';
         };
 
         socket.onerror = (error) => {
             console.error("ERRO DE WEBSOCKET", error);
             connectionStatusEl.textContent = "Erro na conexão. Verifique a chave ou o console.";
-            socket.close();
+            // A 'onclose' será chamada automaticamente após o erro.
         };
     }
 
-    function sendMainMode() {
-        if (!socket || socket.readyState !== WebSocket.OPEN) return;
-        const mode = document.querySelector('input[name="main-mode"]:checked').value;
-        socket.send(JSON.stringify({
-            type: "setMainMode",
-            payload: {
-                mode: mode
-            }
-        }));
-    }
+    // --- Funções de Envio (sem alterações) ---
+    function sendMainMode() { if (!socket || socket.readyState !== WebSocket.OPEN) return; const mode = document.querySelector('input[name="main-mode"]:checked').value; socket.send(JSON.stringify({ type: "setMainMode", payload: { mode: mode } })); }
+    function sendBotConfig() { if (!socket || socket.readyState !== WebSocket.OPEN) return; const pMin = parseInt(botPowerMinSlider.value, 10); const pMax = parseInt(botPowerMaxSlider.value, 10); const cMin = parseInt(botCadenceMinSlider.value, 10); const cMax = parseInt(botCadenceMaxSlider.value, 10); socket.send(JSON.stringify({ type: "setBotConfig", payload: { powerMin: pMin, powerMax: pMax, cadenceMin: cMin, cadenceMax: cMax } })); }
+    function sendPowerConfig() { if (!socket || socket.readyState !== WebSocket.OPEN) return; const mode = document.querySelector('input[name="attack-mode"]:checked').value; const valueMin = parseInt(attackValueMinSlider.value, 10); const valueMax = parseInt(attackValueMaxSlider.value, 10); socket.send(JSON.stringify({ type: "setPowerConfig", payload: { active: attackActiveCheck.checked, mode: mode, valueMin: valueMin, valueMax: valueMax } })); }
+    function sendResistanceConfig() { if (!socket || socket.readyState !== WebSocket.OPEN) return; socket.send(JSON.stringify({ type: "setResistanceConfig", payload: { active: resistanceActiveCheck.checked } })); }
 
-    function sendBotConfig() {
-        if (!socket || socket.readyState !== WebSocket.OPEN) return;
-        const pMin = parseInt(botPowerMinSlider.value, 10);
-        const pMax = parseInt(botPowerMaxSlider.value, 10);
-        const cMin = parseInt(botCadenceMinSlider.value, 10);
-        const cMax = parseInt(botCadenceMaxSlider.value, 10);
-        socket.send(JSON.stringify({
-            type: "setBotConfig",
-            payload: {
-                powerMin: pMin,
-                powerMax: pMax,
-                cadenceMin: cMin,
-                cadenceMax: cMax
-            }
-        }));
-    }
+    // --- Funções de UI (sem alterações) ---
+    function handleMainModeChange() { const mode = document.querySelector('input[name="main-mode"]:checked').value; if (mode === 'bot') { body.classList.add('bot-mode-active'); sendBotConfig(); } else { body.classList.remove('bot-mode-active'); sendPowerConfig(); } sendMainMode(); }
+    function updateBoostSliderDisplay() { const mode = document.querySelector('input[name="attack-mode"]:checked').value; let min = parseInt(attackValueMinSlider.value, 10); let max = parseInt(attackValueMaxSlider.value, 10); if (min > max) { [min, max] = [max, min]; attackValueMinSlider.value = min; attackValueMaxSlider.value = max; } sliderUnitEl.textContent = (mode === 'aditivo') ? 'W' : '%'; sliderValueDisplay.textContent = `${min} - ${max}`; }
+    function updateBotDisplays() { let pMin = parseInt(botPowerMinSlider.value, 10); let pMax = parseInt(botPowerMaxSlider.value, 10); if (pMin > pMax) { [pMin, pMax] = [pMax, pMin]; botPowerMinSlider.value = pMin; botPowerMaxSlider.value = pMax; } botPowerDisplay.textContent = `${pMin} - ${pMax}`; let cMin = parseInt(botCadenceMinSlider.value, 10); let cMax = parseInt(botCadenceMaxSlider.value, 10); if (cMin > cMax) { [cMin, cMax] = [cMax, cMin]; botCadenceMinSlider.value = cMin; botCadenceMaxSlider.value = cMax; } botCadenceDisplay.textContent = `${cMin} - ${cMax}`; }
 
-    function sendPowerConfig() {
-        if (!socket || socket.readyState !== WebSocket.OPEN) return;
-        const mode = document.querySelector('input[name="attack-mode"]:checked').value;
-        const valueMin = parseInt(attackValueMinSlider.value, 10);
-        const valueMax = parseInt(attackValueMaxSlider.value, 10);
-        socket.send(JSON.stringify({
-            type: "setPowerConfig",
-            payload: {
-                active: attackActiveCheck.checked,
-                mode: mode,
-                valueMin: valueMin,
-                valueMax: valueMax
-            }
-        }));
-    }
-
-    function sendResistanceConfig() {
-        if (!socket || socket.readyState !== WebSocket.OPEN) return;
-        socket.send(JSON.stringify({
-            type: "setResistanceConfig",
-            payload: {
-                active: resistanceActiveCheck.checked
-            }
-        }));
-    }
-
-    function handleMainModeChange() {
-        const mode = document.querySelector('input[name="main-mode"]:checked').value;
-        if (mode === 'bot') {
-            body.classList.add('bot-mode-active');
-            sendBotConfig();
-        } else {
-            body.classList.remove('bot-mode-active');
-            sendPowerConfig();
-        }
-        sendMainMode();
-    }
-
-    function updateBoostSliderDisplay() {
-        const mode = document.querySelector('input[name="attack-mode"]:checked').value;
-        let min = parseInt(attackValueMinSlider.value, 10);
-        let max = parseInt(attackValueMaxSlider.value, 10);
-        if (min > max) {
-            [min, max] = [max, min];
-            attackValueMinSlider.value = min;
-            attackValueMaxSlider.value = max;
-        }
-        sliderUnitEl.textContent = (mode === 'aditivo') ? 'W' : '%';
-        sliderValueDisplay.textContent = `${min} - ${max}`;
-    }
-
-    function updateBotDisplays() {
-        let pMin = parseInt(botPowerMinSlider.value, 10);
-        let pMax = parseInt(botPowerMaxSlider.value, 10);
-        if (pMin > pMax) {
-            [pMin, pMax] = [pMax, pMin];
-            botPowerMinSlider.value = pMin;
-            botPowerMaxSlider.value = pMax;
-        }
-        botPowerDisplay.textContent = `${pMin} - ${pMax}`;
-
-        let cMin = parseInt(botCadenceMinSlider.value, 10);
-        let cMax = parseInt(botCadenceMaxSlider.value, 10);
-        if (cMin > cMax) {
-            [cMin, cMax] = [cMax, cMin];
-            botCadenceMinSlider.value = cMin;
-            botCadenceMaxSlider.value = cMax;
-        }
-        botCadenceDisplay.textContent = `${cMin} - ${cMax}`;
-    }
-
-    // Event Listeners
+    // --- Listeners de Eventos (CORRIGIDOS) ---
+    
+    // Adiciona listener ao botão de conexão
     connectButton.addEventListener('click', () => {
         connect(agentKeyInput.value.trim());
     });
+    
+    // Permite conectar pressionando Enter
     agentKeyInput.addEventListener('keyup', (event) => {
         if (event.key === 'Enter') {
             connectButton.click();
         }
     });
-
+    
+    // Outros listeners
     mainModeRadios.forEach(radio => radio.addEventListener('change', handleMainModeChange));
     attackActiveCheck.addEventListener('change', sendPowerConfig);
     attackValueMinSlider.addEventListener('input', updateBoostSliderDisplay);
     attackValueMaxSlider.addEventListener('input', updateBoostSliderDisplay);
     attackValueMinSlider.addEventListener('change', sendPowerConfig);
     attackValueMaxSlider.addEventListener('change', sendPowerConfig);
-    attackModeRadios.forEach(radio => radio.addEventListener('change', () => {
-        updateBoostSliderDisplay();
-        sendPowerConfig();
-    }));
+    attackModeRadios.forEach(radio => radio.addEventListener('change', () => { updateBoostSliderDisplay(); sendPowerConfig(); }));
     botPowerMinSlider.addEventListener('input', updateBotDisplays);
     botPowerMaxSlider.addEventListener('input', updateBotDisplays);
     botCadenceMinSlider.addEventListener('input', updateBotDisplays);

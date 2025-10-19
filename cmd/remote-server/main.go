@@ -18,7 +18,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 )
 
-// --- ESTRUTURAS DE ESTADO (sem alterações na definição) ---
+// --- ESTRUTURAS DE ESTADO ---
 type BotConfig struct {
 	sync.RWMutex
 	PowerMin, PowerMax, CadenceMin, CadenceMax int
@@ -27,7 +27,7 @@ type BotConfig struct {
 type AttackConfig struct {
 	sync.RWMutex
 	Active   bool
-	Mode     string // "aditivo" or "percentual"
+	Mode     string
 	ValueMin int
 	ValueMax int
 }
@@ -58,10 +58,9 @@ type User struct {
 	AgentKey string `json:"agent_key" bson:"agent_key"`
 }
 
-// --- GERENCIADOR DE SESSÕES (MODIFICADO PARA MULTI-USUÁRIO) ---
+// --- GERENCIADOR DE SESSÕES ---
 type SessionManager struct {
 	sync.RWMutex
-	// A chave de todos os mapas agora é a 'agent_key' (string)
 	Agents        map[string]*websocket.Conn
 	Dashboards    map[string]map[*websocket.Conn]bool
 	UserStates    map[string]*UIState
@@ -69,10 +68,8 @@ type SessionManager struct {
 	AttackConfigs map[string]*AttackConfig
 }
 
-// --- VARIÁVEIS GLOBAIS ---
 var (
 	upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-	// Inicializa o SessionManager com mapas vazios
 	sessionManager = &SessionManager{
 		Agents:        make(map[string]*websocket.Conn),
 		Dashboards:    make(map[string]map[*websocket.Conn]bool),
@@ -82,7 +79,7 @@ var (
 	}
 )
 
-// isValidAgentKey (sem alterações)
+// isValidAgentKey verifica se uma chave existe no DB
 func isValidAgentKey(agentKey string) (bool, *User) {
 	if database.DB == nil {
 		log.Println("[AUTH] Erro: DB não disponível.")
@@ -102,16 +99,15 @@ func isValidAgentKey(agentKey string) (bool, *User) {
 	return false, nil
 }
 
-// botLogicRoutine (MODIFICADO para receber agentKey)
+// botLogicRoutine (MODIFICADO para acessar mapas de sessão)
 func botLogicRoutine(ctx context.Context, agentKey string) {
 	log.Printf("[Bot %s] Rotina do bot iniciada.", agentKey)
 	var botPowerTarget, botCadenceTarget int
 	var botPowerNextChange, botCadenceNextChange time.Time
 
-	// Acessa os dados específicos desta sessão
 	botCfg := sessionManager.BotConfigs[agentKey]
 	uiState := sessionManager.UserStates[agentKey]
-	
+
 	powerTicker := time.NewTicker(1 * time.Second)
 	defer powerTicker.Stop()
 
@@ -126,26 +122,44 @@ func botLogicRoutine(ctx context.Context, agentKey string) {
 			agentIsConnected := uiState.AgentConnected
 			uiState.RUnlock()
 
-			if mode != "bot" || !agentIsConnected { continue }
+			if mode != "bot" || !agentIsConnected {
+				continue
+			}
 
-			// Lógica de Potência Dinâmica
+			// Lógica de Potência
 			if time.Now().After(botPowerNextChange) {
-				botCfg.RLock(); pMin, pMax := botCfg.PowerMin, botCfg.PowerMax; botCfg.RUnlock()
-				if pMax > pMin { botPowerTarget = rand.Intn(pMax-pMin+1) + pMin } else { botPowerTarget = pMin }
+				botCfg.RLock()
+				pMin, pMax := botCfg.PowerMin, botCfg.PowerMax
+				botCfg.RUnlock()
+				if pMax > pMin {
+					botPowerTarget = rand.Intn(pMax-pMin+1) + pMin
+				} else {
+					botPowerTarget = pMin
+				}
 				interval := rand.Intn(16) + 15
 				botPowerNextChange = time.Now().Add(time.Duration(interval) * time.Second)
 				log.Printf("[BOT %s] Novo alvo de potência: %dW", agentKey, botPowerTarget)
 			}
 			ruido := rand.Intn(5) - 2
 			potenciaFinal := botPowerTarget + ruido
-			if potenciaFinal < 0 { potenciaFinal = 0 }
-			uiState.Lock(); uiState.ModifiedPower = potenciaFinal; uiState.Unlock()
+			if potenciaFinal < 0 {
+				potenciaFinal = 0
+			}
+			uiState.Lock()
+			uiState.ModifiedPower = potenciaFinal
+			uiState.Unlock()
 			sendCommandToAgent(agentKey, "send_power", map[string]interface{}{"watts": potenciaFinal})
 
-			// Lógica de Cadência Dinâmica
+			// Lógica de Cadência
 			if time.Now().After(botCadenceNextChange) {
-				botCfg.RLock(); cMin, cMax := botCfg.CadenceMin, botCfg.CadenceMax; botCfg.RUnlock()
-				if cMax > cMin { botCadenceTarget = rand.Intn(cMax-cMin+1) + cMin } else { botCadenceTarget = cMin }
+				botCfg.RLock()
+				cMin, cMax := botCfg.CadenceMin, botCfg.CadenceMax
+				botCfg.RUnlock()
+				if cMax > cMin {
+					botCadenceTarget = rand.Intn(cMax-cMin+1) + cMin
+				} else {
+					botCadenceTarget = cMin
+				}
 				interval := rand.Intn(21) + 20
 				botCadenceNextChange = time.Now().Add(time.Duration(interval) * time.Second)
 				log.Printf("[BOT %s] Novo alvo de cadência: %d RPM", agentKey, botCadenceTarget)
@@ -156,15 +170,13 @@ func botLogicRoutine(ctx context.Context, agentKey string) {
 	}
 }
 
-// broadcastToDashboards (MODIFICADO para receber agentKey)
+// broadcastToDashboards (MODIFICADO para acessar mapas de sessão)
 func broadcastToDashboards(ctx context.Context, agentKey string) {
 	log.Printf("[Broadcast %s] Rotina de broadcast iniciada.", agentKey)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-
 	uiState, ok := sessionManager.UserStates[agentKey]
 	if !ok {
-		log.Printf("[Broadcast %s] Erro: estado de UI não encontrado.", agentKey)
 		return
 	}
 
@@ -177,7 +189,6 @@ func broadcastToDashboards(ctx context.Context, agentKey string) {
 			sessionManager.RLock()
 			dashboards, userExists := sessionManager.Dashboards[agentKey]
 			sessionManager.RUnlock()
-
 			if !userExists {
 				continue
 			}
@@ -195,7 +206,6 @@ func broadcastToDashboards(ctx context.Context, agentKey string) {
 			uiState.RUnlock()
 
 			sessionManager.Lock()
-			// Itera apenas sobre os dashboards deste usuário
 			for client := range dashboards {
 				if err := client.WriteMessage(websocket.TextMessage, msg); err != nil {
 					client.Close()
@@ -207,15 +217,14 @@ func broadcastToDashboards(ctx context.Context, agentKey string) {
 	}
 }
 
-// sendCommandToAgent (MODIFICADO para receber agentKey)
+// sendCommandToAgent (MODIFICADO para acessar mapa de sessão)
 func sendCommandToAgent(agentKey string, action string, payload map[string]interface{}) {
 	sessionManager.RLock()
-	conn, ok := sessionManager.Agents[agentKey] // Acessa o agente específico
+	conn, ok := sessionManager.Agents[agentKey]
 	sessionManager.RUnlock()
 	if ok && conn != nil {
-		cmd := AgentCommand{Action: action, Payload: payload}
-		if err := conn.WriteJSON(cmd); err != nil {
-			log.Printf("[SERVER] Erro ao enviar comando para o agente %s: %v", agentKey, err)
+		if err := conn.WriteJSON(AgentCommand{Action: action, Payload: payload}); err != nil {
+			log.Printf("[SERVER] Erro envio cmd para %s: %v", agentKey, err)
 		}
 	}
 }
@@ -231,7 +240,7 @@ func handleAgentConnections(w http.ResponseWriter, r *http.Request, mainCtx cont
 
 	var authMsg map[string]string
 	if err := ws.ReadJSON(&authMsg); err != nil || authMsg["agent_key"] == "" {
-		log.Println("[SERVER] 🔌 Falha auth agente (mensagem malformada).")
+		log.Println("[SERVER] 🔌 Falha auth agente.")
 		return
 	}
 	agentKey := authMsg["agent_key"]
@@ -243,7 +252,6 @@ func handleAgentConnections(w http.ResponseWriter, r *http.Request, mainCtx cont
 
 	sessionManager.Lock()
 	sessionManager.Agents[agentKey] = ws
-	// Inicializa todos os estados para este agente se for a primeira vez
 	if _, ok := sessionManager.UserStates[agentKey]; !ok {
 		log.Printf("[SERVER] Criando nova sessão para o agente %s.", agentKey)
 		sessionManager.UserStates[agentKey] = &UIState{MainMode: "boost"}
@@ -264,77 +272,86 @@ func handleAgentConnections(w http.ResponseWriter, r *http.Request, mainCtx cont
 	go botLogicRoutine(sessionCtx, agentKey)
 	go broadcastToDashboards(sessionCtx, agentKey)
 
-	for { // Loop de leitura do agente
+	for {
 		var event AgentEvent
 		if err := ws.ReadJSON(&event); err != nil {
 			log.Println("[SERVER] 🔌 Agente", agentKey, "desconectado:", err)
 			break
 		}
-		
+
 		switch event.Event {
 		case "app_status":
 			if connected, ok := event.Payload["connected"].(bool); ok {
-				uiState.Lock(); uiState.AppConnected = connected; uiState.Unlock()
+				uiState.Lock()
+				uiState.AppConnected = connected
+				uiState.Unlock()
 				log.Printf("[SERVER] 📲 Agente %s: App %t.", agentKey, connected)
 			}
-
 		case "trainer_data":
 			if power, ok := event.Payload["real_power"].(float64); ok {
 				realPower := int(power)
 				modifiedPower := realPower
-
-				// Lê a cadência real se ela foi enviada
 				if cadence, ok := event.Payload["real_cadence"].(float64); ok {
-					uiState.Lock(); uiState.RealCadence = int(cadence); uiState.Unlock()
+					uiState.Lock()
+					uiState.RealCadence = int(cadence)
+					uiState.Unlock()
 				}
 
-
-				uiState.RLock(); currentMode := uiState.MainMode; uiState.RUnlock()
+				uiState.RLock()
+				currentMode := uiState.MainMode
+				uiState.RUnlock()
 
 				if currentMode == "boost" {
 					attackCfg.RLock()
 					isActive, mode, vMin, vMax := attackCfg.Active, attackCfg.Mode, attackCfg.ValueMin, attackCfg.ValueMax
 					attackCfg.RUnlock()
-
 					if isActive {
 						uiState.Lock()
 						if time.Now().After(uiState.NextBoostChangeTime) {
-							if vMax > vMin { uiState.CurrentBoostTarget = rand.Intn(vMax-vMin+1) + vMin } else { uiState.CurrentBoostTarget = vMin }
-							randomInterval := rand.Intn(16) + 15
-							uiState.NextBoostChangeTime = time.Now().Add(time.Duration(randomInterval) * time.Second)
-							log.Printf("[BOOST %s] Novo alvo: %d (%s) por %ds", agentKey, uiState.CurrentBoostTarget, mode, randomInterval)
+							if vMax > vMin {
+								uiState.CurrentBoostTarget = rand.Intn(vMax-vMin+1) + vMin
+							} else {
+								uiState.CurrentBoostTarget = vMin
+							}
+							interval := rand.Intn(16) + 15
+							uiState.NextBoostChangeTime = time.Now().Add(time.Duration(interval) * time.Second)
+							log.Printf("[BOOST %s] Novo alvo: %d (%s) por %ds", agentKey, uiState.CurrentBoostTarget, mode, interval)
 						}
 						currentBoost := uiState.CurrentBoostTarget
 						uiState.Unlock()
-
 						switch mode {
 						case "aditivo":
 							modifiedPower = realPower + currentBoost
 						case "percentual":
 							modifiedPower = realPower + int(float64(realPower)*(float64(currentBoost)/100.0))
 						}
-						
 						if realPower > 0 {
 							ruido := rand.Intn(5) - 2
 							modifiedPower += ruido
-							if modifiedPower < 0 { modifiedPower = 0 }
+							if modifiedPower < 0 {
+								modifiedPower = 0
+							}
 						}
 					}
 				}
-				
 				if currentMode != "bot" {
-					uiState.Lock(); uiState.RealPower = realPower; uiState.ModifiedPower = modifiedPower; uiState.Unlock()
+					uiState.Lock()
+					uiState.RealPower = realPower
+					uiState.ModifiedPower = modifiedPower
+					uiState.Unlock()
 					sendCommandToAgent(agentKey, "send_power", map[string]interface{}{"watts": modifiedPower})
 				} else {
-					uiState.Lock(); uiState.RealPower = realPower; uiState.Unlock()
+					uiState.Lock()
+					uiState.RealPower = realPower
+					uiState.Unlock()
 				}
 			}
 		}
 	}
 
-	cancel() // Para as goroutines de bot e broadcast deste agente
+	cancel()
 	sessionManager.Lock()
-	delete(sessionManager.Agents, agentKey) // Remove apenas este agente
+	delete(sessionManager.Agents, agentKey)
 	if uiState, ok := sessionManager.UserStates[agentKey]; ok {
 		uiState.AgentConnected = false
 		uiState.AppConnected = false
@@ -350,7 +367,7 @@ func handleAgentConnections(w http.ResponseWriter, r *http.Request, mainCtx cont
 func handleDashboardConnections(w http.ResponseWriter, r *http.Request) {
 	agentKey := r.URL.Query().Get("agentKey")
 	if agentKey == "" {
-		log.Println("[WEB] 🔌 Conexão de dashboard recusada: agentKey não fornecida na URL.")
+		log.Println("[WEB] 🔌 Conexão recusada: agentKey não fornecida.")
 		http.Error(w, "agentKey parameter is required", http.StatusBadRequest)
 		return
 	}
@@ -360,10 +377,8 @@ func handleDashboardConnections(w http.ResponseWriter, r *http.Request) {
 	sessionManager.RUnlock()
 
 	if !agentSessionExists {
-		// A sessão pode ser criada pelo agente a qualquer momento, mas se não existir
-		// ao conectar o dashboard, é melhor recusar para evitar estados órfãos.
-		log.Printf("[WEB] 🔌 Conexão de dashboard recusada: Nenhuma sessão ativa para a chave %s.", agentKey)
-		http.Error(w, "No active session for this agentKey", http.StatusNotFound)
+		log.Printf("[WEB] 🔌 Conexão recusada: Nenhuma sessão para %s.", agentKey)
+		http.Error(w, "No active session for this agentKey. Please connect your agent first.", http.StatusNotFound)
 		return
 	}
 
@@ -377,21 +392,20 @@ func handleDashboardConnections(w http.ResponseWriter, r *http.Request) {
 	sessionManager.Lock()
 	sessionManager.Dashboards[agentKey][conn] = true
 	sessionManager.Unlock()
-	log.Printf("[WEB] Novo dashboard conectado para a sessão %s", agentKey)
-
+	log.Printf("[WEB] Novo dashboard para sessão %s", agentKey)
 	defer func() {
 		sessionManager.Lock()
 		delete(sessionManager.Dashboards[agentKey], conn)
 		sessionManager.Unlock()
-		log.Printf("[WEB] Dashboard desconectado da sessão %s", agentKey)
+		log.Printf("[WEB] Dashboard desconectado de %s", agentKey)
 	}()
 
-	for { // Loop de leitura do dashboard
+	for {
 		var msg map[string]interface{}
 		if err := conn.ReadJSON(&msg); err != nil {
 			break
 		}
-		log.Printf("[WEB] Comando recebido (sessão %s): %v", agentKey, msg)
+		log.Printf("[WEB] Comando (sessão %s): %v", agentKey, msg)
 
 		botCfg := sessionManager.BotConfigs[agentKey]
 		uiState := sessionManager.UserStates[agentKey]
@@ -411,21 +425,37 @@ func handleDashboardConnections(w http.ResponseWriter, r *http.Request) {
 			case "setBotConfig":
 				if payload, ok := msg["payload"].(map[string]interface{}); ok {
 					botCfg.Lock()
-					if v, ok := payload["powerMin"].(float64); ok { botCfg.PowerMin = int(v) }
-					if v, ok := payload["powerMax"].(float64); ok { botCfg.PowerMax = int(v) }
-					if v, ok := payload["cadenceMin"].(float64); ok { botCfg.CadenceMin = int(v) }
-					if v, ok := payload["cadenceMax"].(float64); ok { botCfg.CadenceMax = int(v) }
+					if v, ok := payload["powerMin"].(float64); ok {
+						botCfg.PowerMin = int(v)
+					}
+					if v, ok := payload["powerMax"].(float64); ok {
+						botCfg.PowerMax = int(v)
+					}
+					if v, ok := payload["cadenceMin"].(float64); ok {
+						botCfg.CadenceMin = int(v)
+					}
+					if v, ok := payload["cadenceMax"].(float64); ok {
+						botCfg.CadenceMax = int(v)
+					}
 					botCfg.Unlock()
 				}
 			case "setPowerConfig":
 				if payload, ok := msg["payload"].(map[string]interface{}); ok {
 					attackCfg.Lock()
-					if active, ok := payload["active"].(bool); ok { attackCfg.Active = active }
-					if mode, ok := payload["mode"].(string); ok { attackCfg.Mode = mode }
-					if vMin, ok := payload["valueMin"].(float64); ok { attackCfg.ValueMin = int(vMin) }
-					if vMax, ok := payload["valueMax"].(float64); ok { attackCfg.ValueMax = int(vMax) }
+					if active, ok := payload["active"].(bool); ok {
+						attackCfg.Active = active
+					}
+					if mode, ok := payload["mode"].(string); ok {
+						attackCfg.Mode = mode
+					}
+					if vMin, ok := payload["valueMin"].(float64); ok {
+						attackCfg.ValueMin = int(vMin)
+					}
+					if vMax, ok := payload["valueMax"].(float64); ok {
+						attackCfg.ValueMax = int(vMax)
+					}
 					attackCfg.Unlock()
-					log.Printf("[WEB] Configuração Boost para %s: %+v", agentKey, attackCfg)
+					log.Printf("[WEB] Config Boost para %s: %+v", agentKey, attackCfg)
 				}
 			}
 		}
@@ -434,39 +464,30 @@ func handleDashboardConnections(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	database.InitDB()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 		<-sig
-		log.Println("Sinal de interrupção recebido, encerrando servidor...")
+		log.Println("Sinal recebido, encerrando...")
 		cancel()
 	}()
-
-	http.HandleFunc("/agent", func(w http.ResponseWriter, r *http.Request) {
-		handleAgentConnections(w, r, ctx)
-	})
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		handleDashboardConnections(w, r)
-	})
+	http.HandleFunc("/agent", func(w http.ResponseWriter, r *http.Request) { handleAgentConnections(w, r, ctx) })
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) { handleDashboardConnections(w, r) })
 	http.Handle("/", http.FileServer(http.Dir("./cmd/remote-server/web")))
-
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	log.Printf("🚀 Servidor Remoto iniciado na porta %s...", port)
+	log.Printf("🚀 Servidor Remoto na porta %s...", port)
 	server := &http.Server{Addr: ":" + port}
-
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("ListenAndServe: %s", err)
 		}
 	}()
-
-	<-ctx.Done() // Espera pelo sinal de cancelamento
-	log.Println("Desligando o servidor...")
+	<-ctx.Done()
+	log.Println("Desligando servidor...")
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	server.Shutdown(shutdownCtx)

@@ -51,6 +51,23 @@ func discoverAdapters() (int, int, error) { /* ...código da versão anterior...
 	return clientID, serverID, nil
 }
 
+// discoverOneAdapter encontra o primeiro adaptador BLE disponível - Modo BOT
+func discoverOneAdapter() (int, error) {
+	log.Println("[AGENT-DISCOVERY] Procurando por 1 adaptador BLE (Modo Bot)...")
+	for i := 0; i < 10; i++ {
+		d, err := linux.NewDevice(blelib.OptDeviceID(i))
+		if err != nil {
+			continue // Ignora adaptadores indisponíveis
+		}
+		if err := d.Stop(); err != nil {
+			log.Printf("[AGENT-DISCOVERY] Aviso: falha ao fechar hci%d: %v", i, err)
+		}
+		log.Printf("[AGENT-DISCOVERY] ✅ Adaptador hci%d encontrado.", i)
+		return i, nil // Retorna o ID do primeiro que encontrar
+	}
+	return -1, fmt.Errorf("falha: nenhum adaptador BLE encontrado")
+}
+
 // writePump envia mensagens para o WebSocket
 func writePump(ctx context.Context, c *websocket.Conn, writeChan <-chan interface{}, done chan struct{}) { /* ...código da versão anterior... */
 	pingTicker := time.NewTicker(30 * time.Second)
@@ -192,15 +209,35 @@ func main() {
 	agentKey := flag.String("key", "", "Chave API")
 	trainerMAC := flag.String("mac", "", "MAC Rolo Real")
 	flag.Parse()
+
+// (Código modificado)
 	if *agentKey == "" { log.Fatal("❌ --key obrigatória") }
-	if *trainerMAC == "" { log.Println("⚠️ Aviso: --mac não fornecido. Apenas o rolo virtual funcionará.")}
 
 	addr := "wss://argus-remote-server.onrender.com/agent"
+	
+	var clientAdapterID, serverAdapterID int
+	var err error
 
-	clientAdapterID, serverAdapterID, err := discoverAdapters()
-	if err != nil { log.Fatalf("❌ %v", err) }
+	if *trainerMAC == "" {
+		// MODO BOT (1 Adaptador)
+		log.Println("⚠️ Aviso: --mac não fornecido.")
+		log.Println("     Modo MitM (com rolo real) desativado.")
+		serverAdapterID, err = discoverOneAdapter()
+		if err != nil {
+			log.Fatalf("❌ %v", err)
+		}
+		clientAdapterID = -1 // Sinaliza para pular a rotina do cliente
+		log.Printf("[AGENT] Iniciando em MODO BOT. Rolo virtual em hci%d.", serverAdapterID)
+	
+	} else {
+		// MODO MITM (2 Adaptadores)
+		clientAdapterID, serverAdapterID, err = discoverAdapters()
+		if err != nil {
+			log.Fatalf("❌ %v", err)
+		}
+		log.Printf("[AGENT] Iniciando em MODO MITM. Cliente(hci%d) -> Servidor(hci%d)", clientAdapterID, serverAdapterID)
+	}
 
-	log.Printf("[AGENT] Iniciando... Cliente(hci%d) -> Servidor(hci%d)", clientAdapterID, serverAdapterID)
 	interrupt := make(chan os.Signal, 1); signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
 	ctx, cancel := context.WithCancel(context.Background()); go func() { <-interrupt; log.Println("Encerrando..."); cancel() }()
 
@@ -256,14 +293,22 @@ func main() {
 							// Cria um canal dummy para commandChan (não usado pelo ServerRoutine local)
 							dummyCommandChan := make(chan []byte)
 
-							// Inicia Cliente, Servidor e Bridge
-							bleWg.Add(3) // Espera 3 goroutines: Cliente, Servidor, Bridge
-							log.Println("[AGENT] Iniciando Cliente BLE (pkg/ble)...")
-							go ble.ClientRoutine(bleCtx, bleCfg, dummyCommandChan, uiState, nil, &bleWg) // Passa nil para resistanceCfg
+							// Inicia Servidor e Ponte de Dados (sempre necessários)
 							log.Println("[AGENT] Iniciando Servidor BLE local...")
 							go localServerRoutine(bleCtx, bleCfg, powerChan, cadenceChan, writeChan, &bleWg)
 							log.Println("[AGENT] Iniciando Ponte de Dados...")
 							go dataBridge(bleCtx, uiState, writeChan)
+
+							if clientAdapterID != -1 {
+								// MODO MITM: Inicia também a rotina do cliente
+								bleWg.Add(3) // Espera 3 goroutines
+								log.Println("[AGENT] Iniciando Cliente BLE (pkg/ble)...")
+								go ble.ClientRoutine(bleCtx, bleCfg, dummyCommandChan, uiState, nil, &bleWg)
+							} else {
+								// MODO BOT: Pula a rotina do cliente
+								bleWg.Add(2) // Espera apenas 2 goroutines
+								log.Println("[AGENT] Modo Bot: Rotina do Cliente BLE (conexão com rolo real) ignorada.")
+							}
 
 							bleStarted = true
 						}

@@ -7,6 +7,8 @@ O Argus Framework é uma ferramenta de pesquisa e prototipagem para interceptar,
 
 Ele funciona como um proxy Man-in-the-Middle (MitM), posicionando-se entre o rolo de treino físico e o aplicativo de ciclismo virtual (como Zwift, MyWhoosh, etc.), permitindo a manipulação de dados em tempo real através de uma interface web.
 
+![Interface do Argus Framework](./imagens/interface.png)
+
 ## Objetivo Acadêmico
 
 Este projeto foi desenvolvido como uma ferramenta de **cunho acadêmico** para pesquisa e prototipagem na área de segurança de protocolos de comunicação sem fio.
